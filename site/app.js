@@ -1,6 +1,6 @@
 const OSS_BASE = "https://moyue-release-files.oss-cn-hangzhou.aliyuncs.com";
 const REPO_URL = "https://github.com/Langlijun666/moyue-android";
-const FALLBACK_VERSION = "0.33.8";
+const FALLBACK_VERSION = "0.33.9";
 
 function applyRelease(version, apkUrl, ossZipUrl, size) {
   const apk =
