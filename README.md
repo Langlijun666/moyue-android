@@ -13,9 +13,9 @@
 ## 下载
 
 - [GitHub Releases](https://github.com/Langlijun666/moyue-android/releases/latest)
-- OSS 镜像（ZIP）：`https://moyue-release-files.oss-cn-hangzhou.aliyuncs.com/updates/android/Moyue.Android_0.33.7_arm64.apk.zip`
+- OSS 镜像（ZIP）：`https://moyue-release-files.oss-cn-hangzhou.aliyuncs.com/updates/android/Moyue.Android_0.33.8_arm64.apk.zip`
 
-当前 **v0.33.7 · arm64 · Android 7.0+**，debug 签名测试包，需要允许「安装未知应用」。调试包适合试用，不适合直接上架。
+当前 **v0.33.8 · arm64 · Android 7.0+**，debug 签名测试包，需要允许「安装未知应用」。调试包适合试用，不适合直接上架。
 
 > 阿里云 OSS 默认域名不允许直接公开分发 `.apk`，所以 OSS 渠道提供的是 APK 压缩包；GitHub 渠道可以直接下载 APK。
 
