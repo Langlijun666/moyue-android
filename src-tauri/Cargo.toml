@@ -1,0 +1,35 @@
+[package]
+name = "moyue"
+version = "0.33.3"
+description = "墨阅 · 一个安静的桌面 EPUB / TXT 阅读器"
+authors = ["Moyue"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "moyue_lib"
+# Android needs a cdylib for JNI, but windows-gnu hits the 65k PE export limit
+# with it. `scripts/build-android.mjs` swaps this to ["rlib", "cdylib"] only
+# while the Android build runs.
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+sha2 = "0.10"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tauri-plugin-dialog = "2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

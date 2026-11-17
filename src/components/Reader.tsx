@@ -1,0 +1,2453 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import ePub from "epubjs";
+import type { BookMeta, Progress, ReaderSettings, SearchResult, TocEntry } from "../types";
+import { percentLabel } from "../lib/format";
+import { recordReading } from "../lib/stats";
+import { readerPalette, themePreset } from "../lib/themes";
+import { deleteFont, getFont, putFont } from "../lib/db";
+import {
+  deleteBackground,
+  getBackground,
+  putBackground,
+} from "../lib/db";
+import { decodeTxt, txtToEpub } from "../lib/txt";
+import {
+  loadBookmarks,
+  newBookmarkId,
+  saveBookmarks,
+  type Bookmark,
+} from "../lib/bookmarks";
+import {
+  highlightFill,
+  loadHighlights,
+  newHighlightId,
+  saveHighlights,
+  type Highlight,
+  type HighlightColor,
+} from "../lib/highlights";
+import { Icon } from "./Icons";
+import { SelectionToolbar } from "./SelectionToolbar";
+import { SettingsPanel } from "./SettingsPanel";
+import { TocPanel } from "./TocPanel";
+import { IS_ANDROID } from "../lib/platform";
+import { TtsPlayer, type TtsChapter } from "./TtsPlayer";
+import { ReaderToolsPanel } from "./ReaderToolsPanel";
+
+interface SelectionDraft {
+  cfi: string;
+  text: string;
+  chapter: string;
+  percent: number;
+  left: number;
+  top: number;
+}
+
+type ToolsTab = "search" | "bookmarks" | "highlights";
+
+interface ReaderProps {
+  meta: BookMeta;
+  data: ArrayBuffer;
+  settings: ReaderSettings;
+  initialProgress?: Progress;
+  onBack: () => void;
+  onProgress: (progress: Progress) => void;
+  onSettingsChange: (patch: Partial<ReaderSettings>) => void;
+  onChangeCover: () => void;
+  sidebarHidden: boolean;
+  showSidebarToggle: boolean;
+  onToggleSidebar: () => void;
+  onOpenMusic: () => void;
+  onToggleTheme: () => void;
+}
+
+interface RawNavItem {
+  id?: string;
+  href?: string;
+  label?: string;
+  subitems?: RawNavItem[];
+}
+
+interface SearchIndexSection {
+  index: number;
+  href: string;
+  chapter: string;
+  text: string;
+}
+
+function hexToRgba(hex: string, alpha: number): string {
+  const value = hex.replace("#", "");
+  const normalized =
+    value.length === 3
+      ? value
+          .split("")
+          .map((part) => part + part)
+          .join("")
+      : value;
+  const number = Number.parseInt(normalized, 16);
+  if (!Number.isFinite(number)) return `rgba(49, 43, 36, ${alpha})`;
+  const red = (number >> 16) & 255;
+  const green = (number >> 8) & 255;
+  const blue = number & 255;
+  return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+}
+
+export function Reader({
+  meta,
+  data,
+  settings,
+  initialProgress,
+  onBack,
+  onProgress,
+  onSettingsChange,
+  onChangeCover,
+  sidebarHidden,
+  showSidebarToggle,
+  onToggleSidebar,
+  onOpenMusic,
+  onToggleTheme,
+}: ReaderProps) {
+  const viewerRef = useRef<HTMLDivElement>(null);
+  const bookRef = useRef<any>(null);
+  const renditionRef = useRef<any>(null);
+  const tocRef = useRef<TocEntry[]>([]);
+  const flatTocRef = useRef<TocEntry[]>([]);
+  const percentRef = useRef(initialProgress?.percent ?? 0);
+  const settingsRef = useRef(settings);
+  const onProgressRef = useRef(onProgress);
+  const initialCfiRef = useRef(initialProgress?.cfi);
+  const currentCfiRef = useRef(initialProgress?.cfi);
+  const currentHrefRef = useRef("");
+  const goToNextChapterRef = useRef<() => Promise<void>>(async () => {});
+  const goToPrevChapterRef = useRef<() => Promise<void>>(async () => {});
+  const [toc, setToc] = useState<TocEntry[]>([]);
+  const [currentHref, setCurrentHref] = useState("");
+  const [currentLabel, setCurrentLabel] = useState(initialProgress?.chapter || "正文");
+  const [hasNextChapter, setHasNextChapter] = useState(false);
+  const [hasPrevChapter, setHasPrevChapter] = useState(false);
+  const [percent, setPercent] = useState(initialProgress?.percent ?? 0);
+  const [ready, setReady] = useState(false);
+  const [locationsReady, setLocationsReady] = useState(false);
+  const locationsReadyRef = useRef(false);
+  const [error, setError] = useState<string | null>(null);
+  const [tocOpen, setTocOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [ttsOpen, setTtsOpen] = useState(false);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [toolsTab, setToolsTab] = useState<ToolsTab>("search");
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
+  const [highlights, setHighlights] = useState<Highlight[]>([]);
+  const [selection, setSelection] = useState<SelectionDraft | null>(null);
+  const highlightsRef = useRef<Highlight[]>([]);
+  const applyHighlightsRef = useRef<() => void>(() => {});
+  const openHighlightRef = useRef<(id: string) => void>(() => {});
+  const currentLabelRef = useRef(initialProgress?.chapter || "正文");
+  const readingActivityRef = useRef(0);
+  const customFontUrlRef = useRef<string | null>(null);
+  const [backgroundUrl, setBackgroundUrl] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [searchDone, setSearchDone] = useState(0);
+  const [searchTotal, setSearchTotal] = useState(0);
+  const [searchHasRun, setSearchHasRun] = useState(false);
+  const [searchTotalHits, setSearchTotalHits] = useState(0);
+  const searchIndexRef = useRef<SearchIndexSection[] | null>(null);
+  const searchRunRef = useRef(0);
+  const [chromeHidden, setChromeHidden] = useState(IS_ANDROID);
+  const [showTapHint, setShowTapHint] = useState(IS_ANDROID);
+  const chromeHiddenRef = useRef(chromeHidden);
+  const [flip, setFlip] = useState<"prev" | "next" | null>(null);
+  const [flipNonce, setFlipNonce] = useState(0);
+  const flipTimerRef = useRef<number | null>(null);
+  const turningRef = useRef(false);
+  const turnPageRef = useRef<(direction: "prev" | "next") => void>(() => {});
+  const keyHandlerRef = useRef<(event: KeyboardEvent) => void>(() => {});
+  const panelOpenRef = useRef(false);
+  const wheelLockRef = useRef(0);
+  const suppressClickUntilRef = useRef(0);
+  useEffect(() => {
+    chromeHiddenRef.current = chromeHidden;
+  }, [chromeHidden]);
+
+  const collapseChrome = useCallback(() => {
+    if (IS_ANDROID && !chromeHiddenRef.current) setChromeHidden(true);
+  }, []);
+
+  const isScrollMode = settings.readingMode === "scroll";
+  const effectiveColumns = IS_ANDROID ? 1 : settings.columns;
+  const themeLabel =
+    settings.theme === "custom" ? "自定义" : themePreset(settings.theme).label;
+  const themeIcon =
+    settings.theme === "custom"
+      ? "spark"
+      : themePreset(settings.theme).dark
+        ? "moon"
+        : "sun";
+
+  // The scroll manager only knows the section, not the paragraph the reader is
+  // looking at. Turn the visible text position into a CFI for bookmarks and for
+  // restoring the exact spot after switching reading modes.
+  const currentScrollCfi = useCallback((): string => {
+    const rendition = renditionRef.current;
+    const viewer = viewerRef.current;
+    if (!rendition || !viewer) return "";
+    const scroller = viewer.querySelector<HTMLElement>(".epub-container");
+    const scrollerRect = scroller?.getBoundingClientRect();
+    if (!scroller || !scrollerRect) return "";
+    const probe = scrollerRect.top + scrollerRect.height * 0.32;
+    const rawContents = rendition.getContents?.() ?? [];
+    for (const content of Array.isArray(rawContents) ? rawContents : [rawContents]) {
+      const doc = content?.document as Document | undefined;
+      const frame = doc?.defaultView?.frameElement as HTMLIFrameElement | null;
+      const frameRect = frame?.getBoundingClientRect();
+      if (!frameRect || frameRect.bottom <= scrollerRect.top || frameRect.top >= scrollerRect.bottom) {
+        continue;
+      }
+      if (frameRect.top > probe || frameRect.bottom < probe) continue;
+      const { text, nodes } = collectTextNodes(doc);
+      if (!text.trim()) continue;
+      const offset = getVisibleTextOffset(doc, nodes);
+      if (offset === null) continue;
+      const position = locateOffset(nodes, offset);
+      if (!position) continue;
+      try {
+        const range = doc!.createRange();
+        range.setStart(position.node, position.offset);
+        range.setEnd(position.node, position.offset);
+        const cfi =
+          content?.cfiFromRange?.(range) ?? content?.section?.cfiFromRange?.(range);
+        if (cfi) return cfi;
+      } catch {
+        // Try the next visible section.
+      }
+    }
+    return "";
+  }, []);
+
+  const frameForHref = useCallback((href: string): HTMLIFrameElement | null => {
+    const clean = href.split("#")[0];
+    if (!clean) return null;
+    const frames = Array.from(
+      viewerRef.current?.querySelectorAll<HTMLIFrameElement>(".reader__viewport iframe") ?? [],
+    );
+    return (
+      frames.find((frame) => {
+        const base = frame.contentDocument?.baseURI ?? "";
+        return base.split("#")[0].endsWith(clean) || base.includes(clean);
+      }) ?? null
+    );
+  }, []);
+
+  const jumpToCfi = useCallback(
+    async (cfi: string) => {
+      collapseChrome();
+      const rendition = renditionRef.current;
+      const book = bookRef.current;
+      if (!rendition || !book) return;
+      await rendition.display(cfi).catch(() => undefined);
+      if (!isScrollMode) return;
+      const spineItem = book.spine.get(cfi) as { href?: string } | null;
+      const targetHref = spineItem?.href ?? "";
+      const apply = async () => {
+        try {
+          const range = await book.getRange(cfi).catch(() => null);
+          const fallbackFrame = range?.startContainer?.ownerDocument?.defaultView
+            ?.frameElement as HTMLIFrameElement | null;
+          const frame = frameForHref(targetHref) ?? fallbackFrame;
+          const view = frame?.closest<HTMLElement>(".epub-view");
+          const scroller = viewerRef.current?.querySelector<HTMLElement>(".epub-container");
+          if (!view || !scroller) return;
+          let target = view.offsetTop;
+          const doc = frame?.contentDocument;
+          if (range && doc && range.startContainer.ownerDocument === doc) {
+            const rect = range.getBoundingClientRect();
+            target = Math.max(0, view.offsetTop + rect.top);
+          }
+          const delta = scroller.scrollTop - target;
+          // This is an explicit jump, so correct a large delta too.
+          if (Math.abs(delta) > 4 && Math.abs(delta) < 5000) {
+            scroller.scrollTop = target;
+          }
+        } catch {
+          // A stale CFI should not break navigation.
+        }
+      };
+      window.setTimeout(() => void apply(), 220);
+      window.setTimeout(() => void apply(), 700);
+      window.setTimeout(() => void apply(), 1400);
+      window.setTimeout(() => void apply(), 2200);
+    },
+    [collapseChrome, frameForHref, isScrollMode],
+  );
+
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  // Columns and vertical layout are desktop-only features; never let a saved
+  // desktop value leak into the phone reader.
+  useEffect(() => {
+    if (!IS_ANDROID) return;
+    if (settings.columns !== 1 || settings.vertical) {
+      onSettingsChange({ columns: 1, vertical: false });
+    }
+  }, [settings.columns, settings.vertical, onSettingsChange]);
+
+  useEffect(() => {
+    if (!IS_ANDROID) return;
+    const timer = window.setTimeout(() => setShowTapHint(false), 6000);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let objectUrl: string | null = null;
+    const loadBackground = async () => {
+      if (!settings.backgroundImageId) {
+        setBackgroundUrl(null);
+        return;
+      }
+      try {
+        const record = await getBackground(settings.backgroundImageId);
+        if (!record || disposed) return;
+        objectUrl = URL.createObjectURL(
+          new Blob([record.data], { type: record.type || "image/jpeg" }),
+        );
+        setBackgroundUrl(objectUrl);
+      } catch {
+        // A missing background should not prevent reading.
+      }
+    };
+    void loadBackground();
+    return () => {
+      disposed = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [settings.backgroundImageId]);
+
+  useEffect(() => {
+    let disposed = false;
+    let objectUrl: string | null = null;
+    const loadFont = async () => {
+      if (!settings.customFontId) {
+        if (customFontUrlRef.current) {
+          URL.revokeObjectURL(customFontUrlRef.current);
+          customFontUrlRef.current = null;
+        }
+        const rendition = renditionRef.current;
+        if (rendition) applyReaderTheme(rendition, settingsRef.current, null);
+        return;
+      }
+      try {
+        const record = await getFont(settings.customFontId);
+        if (!record || disposed) return;
+        objectUrl = URL.createObjectURL(
+          new Blob([record.data], { type: "font/ttf" }),
+        );
+        customFontUrlRef.current = objectUrl;
+        const rendition = renditionRef.current;
+        if (!rendition) return;
+        applyReaderTheme(rendition, settingsRef.current, objectUrl);
+        const contents = rendition.getContents?.() ?? [];
+        for (const content of Array.isArray(contents) ? contents : [contents]) {
+          injectCustomFont(content?.document, objectUrl);
+        }
+      } catch {
+        // A broken font should not prevent reading.
+      }
+    };
+    void loadFont();
+    return () => {
+      disposed = true;
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+        if (customFontUrlRef.current === objectUrl) customFontUrlRef.current = null;
+      }
+    };
+  }, [settings.customFontId]);
+
+  useEffect(() => {
+    let pending = 0;
+    let lastTick = Date.now();
+    let disposed = false;
+    readingActivityRef.current = Date.now();
+    const markActive = () => {
+      readingActivityRef.current = Date.now();
+    };
+    const events = ["pointerdown", "keydown", "wheel", "touchstart", "scroll"];
+    for (const event of events) {
+      window.addEventListener(event, markActive, { passive: true });
+    }
+    const flush = () => {
+      if (pending >= 1) {
+        recordReading(meta.id, meta.title, Math.round(pending), 0);
+        pending = 0;
+      }
+    };
+    const timer = window.setInterval(() => {
+      if (disposed) return;
+      const now = Date.now();
+      const delta = (now - lastTick) / 1000;
+      lastTick = now;
+      const active =
+        document.visibilityState === "visible" &&
+        now - readingActivityRef.current < 10 * 60_000;
+      if (active) pending += Math.max(0, Math.min(delta, 30));
+      if (pending >= 20) flush();
+    }, 15_000);
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") flush();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("beforeunload", flush);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      for (const event of events) {
+        window.removeEventListener(event, markActive);
+      }
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("beforeunload", flush);
+      flush();
+    };
+  }, [collapseChrome, meta.id, meta.title]);
+
+  useEffect(() => {
+    onProgressRef.current = onProgress;
+  }, [onProgress]);
+
+  useEffect(() => {
+    tocRef.current = toc;
+    flatTocRef.current = flattenToc(toc);
+  }, [toc]);
+
+  useEffect(() => {
+    panelOpenRef.current = tocOpen || settingsOpen || ttsOpen || toolsOpen;
+    if (tocOpen || settingsOpen || toolsOpen) {
+      // Close the page-turn overlay when a drawer opens.
+      setFlip(null);
+    }
+  }, [tocOpen, settingsOpen, ttsOpen, toolsOpen]);
+
+  useEffect(() => {
+    if (!IS_ANDROID) return;
+    const handler = (event: Event) => {
+      if (selection) {
+        setSelection(null);
+        event.preventDefault();
+        return;
+      }
+      if (toolsOpen) {
+        setToolsOpen(false);
+        event.preventDefault();
+        return;
+      }
+      if (settingsOpen) {
+        setSettingsOpen(false);
+        event.preventDefault();
+        return;
+      }
+      if (tocOpen) {
+        setTocOpen(false);
+        event.preventDefault();
+        return;
+      }
+      if (ttsOpen) {
+        setTtsOpen(false);
+        event.preventDefault();
+      }
+    };
+    window.addEventListener("moyue:android-back", handler);
+    return () => window.removeEventListener("moyue:android-back", handler);
+  }, [selection, toolsOpen, settingsOpen, tocOpen, ttsOpen]);
+
+  useEffect(() => {
+    currentLabelRef.current = currentLabel;
+  }, [currentLabel]);
+
+  useEffect(() => {
+    highlightsRef.current = highlights;
+    applyHighlightsRef.current?.();
+  }, [highlights]);
+
+  useEffect(() => {
+    setBookmarks(loadBookmarks(meta.id));
+    const savedHighlights = loadHighlights(meta.id);
+    highlightsRef.current = savedHighlights;
+    setHighlights(savedHighlights);
+    setSelection(null);
+    searchIndexRef.current = null;
+    setSearchResults([]);
+    setSearchHasRun(false);
+    setSearchTotalHits(0);
+    setSearchQuery("");
+    setToolsOpen(false);
+  }, [meta.id]);
+
+  useEffect(() => {
+    let disposed = false;
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+
+    setReady(false);
+    setError(null);
+    setLocationsReady(false);
+    locationsReadyRef.current = false;
+    setToc([]);
+    tocRef.current = [];
+    if (flipTimerRef.current !== null) {
+      window.clearTimeout(flipTimerRef.current);
+      flipTimerRef.current = null;
+    }
+    turningRef.current = false;
+    setFlip(null);
+
+    // epub.js mutates its input while unpacking; keep the stored copy clean.
+    // TXT books are converted to a small in-memory EPUB so the same reader,
+    // TOC, themes and progress tracking can be reused.
+    let book: any = null;
+    let removeViewerWheel: (() => void) | null = null;
+    let removeScrollListener: (() => void) | null = null;
+    let resizeTimer = 0;
+    let resizeHandler: (() => void) | null = null;
+    let scrollTimer = 0;
+    let lastProgressAt = 0;
+
+    const boot = async () => {
+      try {
+        const source =
+          meta.format === "txt"
+            ? await txtToEpub(decodeTxt(data), meta.title, meta.author, meta.id)
+            : data.slice(0);
+        if (disposed) return;
+
+        book = ePub(source);
+        bookRef.current = book;
+        await book.ready;
+        if (disposed) return;
+
+        const rendition = book.renderTo(viewer, {
+          width: viewer.clientWidth || 900,
+          height: viewer.clientHeight || 640,
+          flow: isScrollMode ? "scrolled-continuous" : "paginated",
+          ...(isScrollMode ? { manager: "continuous" } : {}),
+          spread: effectiveColumns === 2 && !isScrollMode ? "always" : "none",
+          allowScriptedContent: false,
+        });
+        renditionRef.current = rendition;
+        applyReaderTheme(rendition, settingsRef.current, customFontUrlRef.current);
+
+        const wheelDocs = new WeakSet<Document>();
+        const onWheel = (event: WheelEvent) => {
+          if (panelOpenRef.current || event.ctrlKey || event.metaKey) return;
+          const multiplier =
+            event.deltaMode === WheelEvent.DOM_DELTA_LINE
+              ? 16
+              : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+                ? 100
+                : 1;
+          const delta = event.deltaY * multiplier;
+          if (Math.abs(delta) < 18) return;
+
+          if (settingsRef.current.readingMode === "scroll") {
+            const scroller = viewer.querySelector<HTMLElement>(".epub-container") ?? viewer;
+            event.preventDefault();
+            scroller.scrollTop += delta;
+            return;
+          }
+
+          event.preventDefault();
+          const now = Date.now();
+          if (now - wheelLockRef.current < 520) return;
+          wheelLockRef.current = now;
+          turnPageRef.current(delta > 0 ? "next" : "prev");
+        };
+
+        rendition.hooks.content.register((contents: any) => {
+          const document = contents?.document as Document | undefined;
+          if (!document || wheelDocs.has(document)) return;
+          wheelDocs.add(document);
+          injectCustomFont(document, customFontUrlRef.current);
+          document.addEventListener("wheel", onWheel, { passive: false });
+          document.addEventListener(
+            "pointerdown",
+            () => {
+              readingActivityRef.current = Date.now();
+            },
+            { passive: true },
+          );
+          document.addEventListener(
+            "wheel",
+            () => {
+              readingActivityRef.current = Date.now();
+            },
+            { passive: true },
+          );
+          if (IS_ANDROID) {
+            const isInteractive = (target: EventTarget | null) =>
+              target instanceof Element &&
+              Boolean(target.closest("a, button, input, textarea, select"));
+            const handleTap = (clientX: number, target: EventTarget | null): boolean => {
+              if (isInteractive(target)) return false;
+              const selection = document.getSelection();
+              if (selection && selection.toString().trim()) return false;
+              // The toolbar is a menu, not a reading layout. Any tap while it
+              // is open simply dismisses it, without turning a page.
+              if (!chromeHiddenRef.current) {
+                setChromeHidden(true);
+                setShowTapHint(false);
+                return true;
+              }
+              if (settingsRef.current.readingMode !== "scroll") {
+                const frame = document.defaultView?.frameElement as HTMLElement | null;
+                const frameRect = frame?.getBoundingClientRect();
+                const viewport = frame?.closest(".reader__viewport")?.getBoundingClientRect();
+                if (frameRect && viewport && viewport.width > 0) {
+                  const x = frameRect.left + clientX - viewport.left;
+                  if (Number.isFinite(x) && x >= 0 && x <= viewport.width) {
+                    if (x < viewport.width * 0.3) {
+                      turnPageRef.current("prev");
+                      return true;
+                    }
+                    if (x > viewport.width * 0.7) {
+                      turnPageRef.current("next");
+                      return true;
+                    }
+                  }
+                }
+              }
+              setChromeHidden((visible) => !visible);
+              setShowTapHint(false);
+              return true;
+            };
+
+            let touchStartX = 0;
+            let touchStartY = 0;
+            let touching = false;
+            document.addEventListener(
+              "touchstart",
+              (event: TouchEvent) => {
+                const touch = event.touches[0];
+                if (!touch) return;
+                touching = true;
+                touchStartX = touch.clientX;
+                touchStartY = touch.clientY;
+              },
+              { passive: true },
+            );
+            document.addEventListener(
+              "touchend",
+              (event: TouchEvent) => {
+                if (!touching) return;
+                touching = false;
+                const touch = event.changedTouches[0];
+                if (!touch) return;
+                const dx = touch.clientX - touchStartX;
+                const dy = touch.clientY - touchStartY;
+                if (settingsRef.current.readingMode !== "scroll") {
+                  if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.3) {
+                    suppressClickUntilRef.current = Date.now() + 500;
+                    turnPageRef.current(dx < 0 ? "next" : "prev");
+                    return;
+                  }
+                }
+                // A real tap toggles the toolbar even on WebViews where the
+                // synthesized click is unreliable. Suppress the click that
+                // follows so the chrome does not immediately toggle back.
+                if (Math.abs(dx) <= 12 && Math.abs(dy) <= 12) {
+                  if (handleTap(touch.clientX, event.target)) {
+                    suppressClickUntilRef.current = Date.now() + 500;
+                  }
+                }
+              },
+              { passive: true },
+            );
+            document.addEventListener("click", (event: MouseEvent) => {
+              if (Date.now() < suppressClickUntilRef.current) return;
+              handleTap(event.clientX, event.target);
+            });
+          }
+
+          // Key events inside the epub.js iframe do not bubble to the parent
+          // window, so forward them to the same reader shortcut handler.
+          document.addEventListener("keydown", (event: KeyboardEvent) => {
+            readingActivityRef.current = Date.now();
+            keyHandlerRef.current(event);
+          });
+
+          const showSelection = () => {
+            window.setTimeout(() => {
+              const sel = document.getSelection();
+              if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+                setSelection(null);
+                return;
+              }
+              const range = sel.getRangeAt(0);
+              const text = sel.toString().replace(/\s+/g, " ").trim();
+              if (!text) {
+                setSelection(null);
+                return;
+              }
+              let cfi = "";
+              try {
+                cfi =
+                  contents.section?.cfiFromRange?.(range) ??
+                  contents.cfiFromRange?.(range) ??
+                  "";
+              } catch {
+                cfi = "";
+              }
+              if (!cfi) {
+                setSelection(null);
+                return;
+              }
+              const rect = range.getBoundingClientRect();
+              const frame = document.defaultView?.frameElement as HTMLElement | null;
+              const frameRect = frame?.getBoundingClientRect();
+              if (!frameRect) return;
+              const rawLeft = frameRect.left + rect.left;
+              const left = Math.min(
+                Math.max(12, rawLeft),
+                Math.max(12, window.innerWidth - 286),
+              );
+              const rawTop = frameRect.top + rect.top - 52;
+              const top =
+                rawTop < 76 ? frameRect.top + rect.bottom + 10 : rawTop;
+              const href = contents.section?.href ?? "";
+              setSelection({
+                cfi,
+                text: text.slice(0, 400),
+                chapter: findLabel(tocRef.current, href) || currentLabelRef.current,
+                percent: percentRef.current,
+                left,
+                top,
+              });
+            }, 10);
+          };
+
+          document.addEventListener("mouseup", showSelection);
+          document.addEventListener("touchend", showSelection);
+          document.addEventListener("mousedown", () => setSelection(null));
+        });
+        viewer.addEventListener("wheel", onWheel, { passive: false });
+        removeViewerWheel = () => viewer.removeEventListener("wheel", onWheel);
+
+        const onResize = () => {
+          if (resizeTimer) window.clearTimeout(resizeTimer);
+          resizeTimer = window.setTimeout(() => {
+            if (renditionRef.current !== rendition) return;
+            const width = viewer.clientWidth;
+            const height = viewer.clientHeight;
+            if (width > 0 && height > 0) {
+              try {
+                rendition.resize(width, height);
+              } catch {
+                // The rendition may be between teardown and re-render.
+              }
+            }
+          }, 120);
+        };
+        resizeHandler = onResize;
+        window.addEventListener("resize", onResize);
+
+        const navigation = await book.loaded.navigation;
+        if (!disposed) {
+          const entries = mapToc(navigation?.toc ?? []);
+          setToc(entries);
+          tocRef.current = entries;
+          flatTocRef.current = flattenToc(entries);
+        }
+
+        const startCfi = currentCfiRef.current || initialCfiRef.current;
+        try {
+          await rendition.display(startCfi || undefined);
+        } catch {
+          await rendition.display();
+        }
+        if (disposed) return;
+
+        setReady(true);
+
+        const applyHighlights = () => {
+          const annotations = rendition.annotations;
+          if (!annotations) return;
+          for (const highlight of highlightsRef.current) {
+            try {
+              annotations.remove(highlight.cfi, "highlight");
+              annotations.highlight(
+                highlight.cfi,
+                { id: highlight.id },
+                () => openHighlightRef.current(highlight.id),
+                "moyue-highlight",
+                {
+                  fill: highlightFill(highlight.color),
+                  "fill-opacity": "0.3",
+                },
+              );
+            } catch {
+              // The section may not be rendered yet.
+            }
+          }
+        };
+        applyHighlightsRef.current = applyHighlights;
+        openHighlightRef.current = () => {
+          setToolsTab("highlights");
+          setToolsOpen(true);
+        };
+        rendition.on("rendered", applyHighlights);
+        applyHighlights();
+
+        const markChapterPosition = (href: string) => {
+          const chapters = flatTocRef.current;
+          const index = chapters.findIndex(
+            (entry) => (entry.href ?? "").split("#")[0] === href.split("#")[0],
+          );
+          if (index >= 0) {
+            setHasPrevChapter(index > 0);
+            setHasNextChapter(index < chapters.length - 1);
+            return;
+          }
+          const items = book.spine?.spineItems ?? [];
+          const spineIndex = items.findIndex(
+            (item: any) => (item.href ?? "").split("#")[0] === href.split("#")[0],
+          );
+          setHasPrevChapter(spineIndex > 0);
+          setHasNextChapter(spineIndex >= 0 && spineIndex < items.length - 1);
+        };
+
+        const updateFromLocation = (location: any, allowZero = false) => {
+          const href = location?.start?.href ?? "";
+          if (href) currentHrefRef.current = href;
+          const label = findLabel(tocRef.current, href) || "正文";
+          let nextPercent = percentRef.current;
+          try {
+            if (locationsReadyRef.current && book.locations.length() > 0) {
+              nextPercent = book.locations.percentageFromCfi(location?.start?.cfi ?? "");
+            } else {
+              const chapters = flatTocRef.current;
+              const index = chapters.findIndex(
+                (entry) => entry.href.split("#")[0] === href.split("#")[0],
+              );
+              if (index >= 0) {
+                nextPercent = chapters.length > 1 ? index / (chapters.length - 1) : 0;
+              } else if (allowZero) {
+                nextPercent = 0;
+              }
+            }
+          } catch {
+            // An unknown CFI should not interrupt reading.
+          }
+          if (Number.isFinite(nextPercent)) {
+            percentRef.current = nextPercent;
+            setPercent(nextPercent);
+          }
+          setCurrentHref(href);
+          setCurrentLabel(label);
+          markChapterPosition(href);
+          if (location?.start?.cfi) {
+            currentCfiRef.current = location.start.cfi;
+            onProgressRef.current({
+              cfi: location.start.cfi,
+              percent: percentRef.current,
+              chapter: label,
+              updatedAt: Date.now(),
+            });
+          }
+        };
+
+        const findVisibleChapter = (scroller: HTMLElement): string | undefined => {
+          const scrollerRect = scroller.getBoundingClientRect();
+          const probe = scrollerRect.top + scrollerRect.height * 0.35;
+          const frames = Array.from(viewer.querySelectorAll("iframe"));
+          let fallback: string | undefined;
+
+          for (const frame of frames) {
+            const rect = frame.getBoundingClientRect();
+            if (rect.bottom <= scrollerRect.top || rect.top >= scrollerRect.bottom) continue;
+            try {
+              const heading = frame.contentDocument
+                ?.querySelector("h1, h2, h3")
+                ?.textContent?.replace(/\s+/g, " ")
+                .trim();
+              if (heading && rect.top <= probe && rect.bottom >= probe) return heading;
+              if (heading && !fallback) fallback = heading;
+            } catch {
+              // Ignore inaccessible frames; the next section may still work.
+            }
+          }
+          return fallback;
+        };
+
+        const restoreScrollPosition = () => {
+          const scroller = viewer.querySelector<HTMLElement>(".epub-container");
+          if (!scroller) return;
+          const maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+          const target = Math.min(maxScroll, Math.max(0, percentRef.current * maxScroll));
+          if (Math.abs(scroller.scrollTop - target) > 3) {
+            scroller.scrollTop = target;
+          }
+        };
+
+        const updateScrollLocation = () => {
+          if (!isScrollMode || disposed) return;
+          const scroller = viewer.querySelector<HTMLElement>(".epub-container");
+          if (!scroller) return;
+
+          const maxScroll = Math.max(1, scroller.scrollHeight - scroller.clientHeight);
+          const ratio = Math.min(1, Math.max(0, scroller.scrollTop / maxScroll));
+          const label = findVisibleChapter(scroller) || currentLabel || "正文";
+          let cfi = currentCfiRef.current || "";
+
+          try {
+            if (locationsReadyRef.current && book.locations.length() > 0) {
+              cfi = book.locations.cfiFromPercentage(ratio) || cfi;
+            }
+          } catch {
+            // Keep the last known CFI if location lookup fails.
+          }
+
+          percentRef.current = ratio;
+          setPercent(ratio);
+          setCurrentLabel(label);
+          const href = findHrefByLabel(tocRef.current, label);
+          if (href) {
+            currentHrefRef.current = href;
+            setCurrentHref(href);
+            markChapterPosition(href);
+          }
+
+          if (cfi) {
+            currentCfiRef.current = cfi;
+            const now = Date.now();
+            if (now - lastProgressAt > 300 || ratio >= 1) {
+              lastProgressAt = now;
+              onProgressRef.current({
+                cfi,
+                percent: ratio,
+                chapter: label,
+                updatedAt: now,
+              });
+            }
+          }
+        };
+
+        const attachScrollListener = () => {
+          const scroller = viewer.querySelector<HTMLElement>(".epub-container");
+          if (!scroller) return;
+          const onScroll = () => {
+            if (scrollTimer) return;
+            scrollTimer = window.setTimeout(() => {
+              scrollTimer = 0;
+              updateScrollLocation();
+            }, 90);
+          };
+          scroller.addEventListener("scroll", onScroll, { passive: true });
+          removeScrollListener = () => {
+            scroller.removeEventListener("scroll", onScroll);
+            if (scrollTimer) {
+              window.clearTimeout(scrollTimer);
+              scrollTimer = 0;
+            }
+          };
+        };
+
+        if (isScrollMode) {
+          attachScrollListener();
+          window.requestAnimationFrame(() => {
+            restoreScrollPosition();
+            updateScrollLocation();
+          });
+        } else {
+          rendition.on("relocated", (location: any) => updateFromLocation(location));
+          window.requestAnimationFrame(() => {
+            if (disposed) return;
+            const current = rendition.currentLocation?.();
+            if (current) updateFromLocation(current);
+          });
+        }
+
+        // epub.js waits 100ms after every spine section by default. For a
+        // 1000+ chapter TXT that keeps the progress bar disabled for minutes.
+        // Remove the artificial pause so locations are ready quickly.
+        book.locations.pause = 0;
+        book.locations
+          .generate(1600)
+          .then(() => {
+            if (disposed) return;
+            locationsReadyRef.current = true;
+            setLocationsReady(true);
+            if (isScrollMode) {
+              updateScrollLocation();
+            } else {
+              const current = rendition.currentLocation?.();
+              if (current) updateFromLocation(current, true);
+            }
+          })
+          .catch(() => {
+            if (!disposed) setLocationsReady(false);
+          });
+      } catch (err) {
+        if (disposed) return;
+        console.error(err);
+        setError(
+          meta.format === "txt"
+            ? "这段文字暂时打不开。TXT 文件可能为空，或编码无法识别。"
+            : "这本书暂时打不开。文件可能损坏，或不是标准的 EPUB。",
+        );
+      }
+    };
+
+    void boot();
+
+    return () => {
+      disposed = true;
+      applyHighlightsRef.current = () => {};
+      openHighlightRef.current = () => {};
+      if (resizeHandler) window.removeEventListener("resize", resizeHandler);
+      if (resizeTimer) window.clearTimeout(resizeTimer);
+      removeViewerWheel?.();
+      removeScrollListener?.();
+      if (scrollTimer) {
+        window.clearTimeout(scrollTimer);
+        scrollTimer = 0;
+      }
+      const liveLocation = isScrollMode ? null : renditionRef.current?.currentLocation?.();
+      if (liveLocation?.start?.cfi) {
+        currentCfiRef.current = liveLocation.start.cfi;
+      } else if (isScrollMode) {
+        const precise = currentScrollCfi();
+        if (precise) currentCfiRef.current = precise;
+      }
+      try {
+        renditionRef.current?.destroy();
+      } catch {
+        // Ignore teardown races.
+      }
+      try {
+        book?.destroy();
+      } catch {
+        // Ignore teardown races.
+      }
+      renditionRef.current = null;
+      bookRef.current = null;
+    };
+    // The reader is intentionally tied to a book identity and reading mode,
+    // not every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meta.id, isScrollMode, effectiveColumns]);
+
+  useEffect(() => {
+    const rendition = renditionRef.current;
+    if (!rendition) return;
+    applyReaderTheme(rendition, settings, customFontUrlRef.current);
+  }, [settings]);
+
+  const turnPage = useCallback(async (direction: "prev" | "next") => {
+    const rendition = renditionRef.current;
+    if (!rendition || turningRef.current) return;
+    collapseChrome();
+
+    setSelection(null);
+    turningRef.current = true;
+    setFlip(direction);
+    setFlipNonce((value) => value + 1);
+    if (flipTimerRef.current !== null) {
+      window.clearTimeout(flipTimerRef.current);
+    }
+    const effect = settingsRef.current.pageEffect;
+    const flipDuration =
+      effect === "curl" ? 580 : effect === "sweep" ? 480 : effect === "none" ? 240 : 460;
+    flipTimerRef.current = window.setTimeout(() => {
+      setFlip(null);
+      turningRef.current = false;
+    }, flipDuration);
+
+    const before = rendition.currentLocation?.();
+    let moved = false;
+    try {
+      if (direction === "prev") await rendition.prev();
+      else await rendition.next();
+      const after = rendition.currentLocation?.();
+      moved = Boolean(after?.start?.cfi && after.start.cfi !== before?.start?.cfi);
+    } catch {
+      moved = false;
+    }
+
+    if (!moved) {
+      // epub.js does not always leave the current spine section when a page
+      // turn reaches the end; continue into the adjacent chapter instead.
+      try {
+        if (direction === "next") await goToNextChapterRef.current();
+        else await goToPrevChapterRef.current();
+      } catch {
+        // At the first or last page of the book there is nowhere to go.
+      }
+    }
+
+    if (direction === "next") recordReading(meta.id, meta.title, 0, 1);
+  }, [collapseChrome, meta.id, meta.title]);
+
+  useEffect(() => {
+    turnPageRef.current = turnPage;
+  }, [turnPage]);
+
+  const loadCurrentChapterText = useCallback(async (): Promise<TtsChapter | null> => {
+    const book = bookRef.current;
+    const rendition = renditionRef.current;
+    if (!book || !rendition) return null;
+
+    const location = rendition.currentLocation?.();
+    const href = (location?.start?.href ?? "").split("#")[0];
+    const sections = book.spine?.spineItems ?? [];
+    const sectionIndex = sections.findIndex(
+      (item: any) => (item.href ?? "").split("#")[0] === href,
+    );
+    const rawContents = rendition.getContents?.() ?? [];
+    const contents = Array.isArray(rawContents) ? rawContents : [rawContents];
+    const holder =
+      contents.find((item: any) => (item?.section?.href ?? "").split("#")[0] === href) ??
+      contents[0];
+    let documentElement = holder?.document as Document | undefined;
+
+    if (!documentElement) {
+      const frame = viewerRef.current?.querySelector<HTMLIFrameElement>("iframe");
+      documentElement = frame?.contentDocument ?? undefined;
+    }
+
+    const { text, nodes } = collectTextNodes(documentElement);
+    if (text.trim().length <= 5) return null;
+
+    let startOffset = getVisibleTextOffset(documentElement, nodes) ?? 0;
+    if (startOffset === 0) {
+      try {
+        const range = await book.getRange(location?.start?.cfi);
+        let startContainer = range?.startContainer;
+        let startNodeOffset = range?.startOffset ?? 0;
+        if (startContainer && startContainer.nodeType !== Node.TEXT_NODE) {
+          const walker = documentElement?.createTreeWalker(
+            startContainer,
+            NodeFilter.SHOW_TEXT,
+          );
+          const firstText = walker?.nextNode();
+          if (firstText) {
+            startContainer = firstText;
+            startNodeOffset = 0;
+          }
+        }
+        if (startContainer) {
+          const entry = nodes.find((node) => node.node === startContainer);
+          if (entry) {
+            startOffset = Math.min(text.length, entry.start + startNodeOffset);
+          }
+        }
+      } catch {
+        // Fall back to the chapter start if the visible range cannot be resolved.
+      }
+    }
+
+    return {
+      text,
+      startOffset,
+      sectionIndex: Math.max(0, sectionIndex),
+      href,
+    };
+  }, []);
+
+  const loadNextChapterText = useCallback(async (): Promise<TtsChapter | null> => {
+    const book = bookRef.current;
+    const rendition = renditionRef.current;
+    if (!book || !rendition) return null;
+
+    const currentHref = (rendition.currentLocation?.()?.start?.href ?? "").split("#")[0];
+    const items = book.spine?.spineItems ?? [];
+    const index = items.findIndex(
+      (item: any) => (item.href ?? "").split("#")[0] === currentHref,
+    );
+    if (index < 0) return null;
+
+    for (let nextIndex = index + 1; nextIndex < items.length; nextIndex += 1) {
+      const item = items[nextIndex];
+      if (item.linear === false) continue;
+      try {
+        await rendition.display(item.href);
+        await new Promise((resolve) => window.setTimeout(resolve, 260));
+        const { text } = collectTextNodes(item.document);
+        if (text.trim().length > 20) {
+          return {
+            text,
+            startOffset: 0,
+            sectionIndex: nextIndex,
+            href: item.href,
+          };
+        }
+      } catch {
+        // Try the following section if this one cannot be displayed.
+      }
+    }
+    return null;
+  }, []);
+
+  const ttsHighlightRef = useRef<string | null>(null);
+
+  const clearTtsHighlight = useCallback(() => {
+    const rendition = renditionRef.current;
+    const cfi = ttsHighlightRef.current;
+    if (rendition && cfi) {
+      try {
+        rendition.annotations?.remove(cfi, "highlight");
+      } catch {
+        // The iframe may have been torn down already.
+      }
+    }
+    ttsHighlightRef.current = null;
+  }, []);
+
+  const highlightTtsSentence = useCallback(
+    async (chapter: TtsChapter, start: number, length: number) => {
+      const book = bookRef.current;
+      const rendition = renditionRef.current;
+      if (!book || !rendition) return;
+      const item = book.spine?.spineItems?.[chapter.sectionIndex];
+      if (!item) return;
+
+      try {
+        if (!item.document) {
+          await item.load(book.load.bind(book));
+        }
+        const { nodes } = collectTextNodes(item.document);
+        const startPosition = locateOffset(nodes, start);
+        const endPosition = locateOffset(nodes, start + length);
+        if (!startPosition || !endPosition) return;
+
+        const range = item.document.createRange();
+        range.setStart(startPosition.node, startPosition.offset);
+        range.setEnd(endPosition.node, endPosition.offset);
+        const cfi = item.cfiFromRange(range);
+
+        clearTtsHighlight();
+        rendition.annotations?.highlight(
+          cfi,
+          {},
+          undefined,
+          "tts-highlight",
+          { fill: "#d9a441", "fill-opacity": "0.28" },
+        );
+        ttsHighlightRef.current = cfi;
+        void rendition.display(cfi).catch(() => undefined);
+      } catch {
+        // TTS audio is more important than a highlight failure.
+      }
+    },
+    [clearTtsHighlight],
+  );
+
+  useEffect(() => {
+    return () => clearTtsHighlight();
+  }, [clearTtsHighlight]);
+
+  useEffect(() => {
+    return () => {
+      if (flipTimerRef.current !== null) {
+        window.clearTimeout(flipTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleKeyDown = useCallback(
+    (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        setSelection(null);
+        setTocOpen(false);
+        setSettingsOpen(false);
+        setTtsOpen(false);
+        setToolsTab("search");
+        setToolsOpen(true);
+        return;
+      }
+
+      if (event.key === "Escape") {
+        if (selection) setSelection(null);
+        else if (toolsOpen) setToolsOpen(false);
+        else if (ttsOpen) setTtsOpen(false);
+        else if (tocOpen) setTocOpen(false);
+        else if (settingsOpen) setSettingsOpen(false);
+        return;
+      }
+      if (!ready || tocOpen || settingsOpen || ttsOpen || toolsOpen) return;
+
+      if (settings.readingMode === "scroll") {
+        const scroller = viewerRef.current?.querySelector<HTMLElement>(".epub-container") ?? viewerRef.current;
+        if (!scroller) return;
+        const isDown = ["ArrowDown", "PageDown", " "].includes(event.key);
+        const isUp = ["ArrowUp", "PageUp"].includes(event.key);
+        if (!isDown && !isUp) return;
+        event.preventDefault();
+        const amount = event.key === "PageDown" || event.key === " " ? scroller.clientHeight * 0.85 : 90;
+        scroller.scrollTop += isDown ? amount : -amount;
+        return;
+      }
+
+      if (event.key === "ArrowLeft" || event.key === "PageUp") {
+        event.preventDefault();
+        void turnPage("prev");
+      }
+      if (event.key === "ArrowRight" || event.key === "PageDown" || event.key === " ") {
+        event.preventDefault();
+        void turnPage("next");
+      }
+    },
+    [ready, tocOpen, settingsOpen, ttsOpen, toolsOpen, selection, settings.readingMode, turnPage],
+  );
+
+  useEffect(() => {
+    keyHandlerRef.current = handleKeyDown;
+  }, [handleKeyDown]);
+
+  useEffect(() => {
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [handleKeyDown]);
+
+  // In the continuous scroll manager display(href) can stop just short of the
+  // section boundary, leaving the previous chapter's last line on screen.
+  const alignScrollToHref = useCallback(
+    (href: string) => {
+      if (!isScrollMode) return;
+      const clean = href.split("#")[0];
+      const apply = () => {
+        const scroller = viewerRef.current?.querySelector<HTMLElement>(".epub-container");
+        const frame = frameForHref(clean);
+        const view = frame?.closest<HTMLElement>(".epub-view");
+        if (!scroller || !view) return;
+        const delta = scroller.scrollTop - view.offsetTop;
+        // Correct epub.js landing slightly off the boundary, but do not yank
+        // the reader back if they have already scrolled somewhere else.
+        if (Math.abs(delta) > 4 && Math.abs(delta) < 400) {
+          scroller.scrollTop = view.offsetTop;
+        }
+      };
+      for (const delay of [140, 420, 900, 1500, 2400, 3200]) {
+        window.setTimeout(apply, delay);
+      }
+    },
+    [collapseChrome, frameForHref, isScrollMode],
+  );
+
+  const jumpTo = (href: string) => {
+    collapseChrome();
+    setTocOpen(false);
+    const display = renditionRef.current?.display(href);
+    if (display) {
+      void display.then(() => alignScrollToHref(href)).catch(() => undefined);
+    }
+  };
+
+  const goToNextChapter = useCallback(async () => {
+    const rendition = renditionRef.current;
+    if (!rendition) return;
+    collapseChrome();
+    setSelection(null);
+    const href = (currentHrefRef.current || rendition.currentLocation?.()?.start?.href || "").split("#")[0];
+    const chapters = flatTocRef.current;
+    const index = chapters.findIndex(
+      (entry) => (entry.href ?? "").split("#")[0] === href,
+    );
+    if (index >= 0 && index < chapters.length - 1) {
+      const target = chapters[index + 1].href;
+      await rendition.display(target).catch(() => undefined);
+      alignScrollToHref(target);
+      return;
+    }
+
+    // Books without a usable TOC still have a spine order.
+    const items = bookRef.current?.spine?.spineItems ?? [];
+    const spineIndex = items.findIndex(
+      (item: any) => (item.href ?? "").split("#")[0] === href,
+    );
+    for (let next = spineIndex + 1; next > 0 && next < items.length; next += 1) {
+      if (items[next].linear === false) continue;
+      try {
+        await rendition.display(items[next].href);
+        alignScrollToHref(items[next].href);
+        return;
+      } catch {
+        // Try the following section.
+      }
+    }
+  }, [alignScrollToHref, collapseChrome]);
+
+  const goToPrevChapter = useCallback(async () => {
+    const rendition = renditionRef.current;
+    if (!rendition) return;
+    collapseChrome();
+    setSelection(null);
+    const href = (currentHrefRef.current || rendition.currentLocation?.()?.start?.href || "").split("#")[0];
+    const chapters = flatTocRef.current;
+    const index = chapters.findIndex(
+      (entry) => (entry.href ?? "").split("#")[0] === href,
+    );
+    if (index > 0) {
+      const target = chapters[index - 1].href;
+      await rendition.display(target).catch(() => undefined);
+      alignScrollToHref(target);
+      return;
+    }
+
+    // Books without a usable TOC still have a spine order.
+    const items = bookRef.current?.spine?.spineItems ?? [];
+    const spineIndex = items.findIndex(
+      (item: any) => (item.href ?? "").split("#")[0] === href,
+    );
+    for (let prev = spineIndex - 1; prev >= 0; prev -= 1) {
+      if (items[prev].linear === false) continue;
+      try {
+        await rendition.display(items[prev].href);
+        alignScrollToHref(items[prev].href);
+        return;
+      } catch {
+        // Try the previous section.
+      }
+    }
+  }, [alignScrollToHref, collapseChrome]);
+
+  useEffect(() => {
+    goToNextChapterRef.current = goToNextChapter;
+    goToPrevChapterRef.current = goToPrevChapter;
+  }, [goToNextChapter, goToPrevChapter]);
+
+  const seek = (value: number) => {
+    const book = bookRef.current;
+    const rendition = renditionRef.current;
+    if (!book || !rendition) return;
+    try {
+      if (locationsReadyRef.current && book.locations.length() > 0) {
+        const cfi = book.locations.cfiFromPercentage(value / 1000);
+        if (cfi) {
+          void rendition.display(cfi);
+          return;
+        }
+      }
+
+      // Before epub.js finishes generating locations, fall back to the
+      // chapter list so the slider still works immediately.
+      const chapters = flatTocRef.current;
+      if (chapters.length === 0) return;
+      const index = Math.min(
+        chapters.length - 1,
+        Math.max(0, Math.round((value / 1000) * (chapters.length - 1))),
+      );
+      const href = chapters[index]?.href;
+      if (href) void rendition.display(href);
+    } catch {
+      // Ignore a slider move before the book is ready.
+    }
+  };
+
+  const openTools = (tab: ToolsTab) => {
+    setTocOpen(false);
+    setSettingsOpen(false);
+    setTtsOpen(false);
+    setToolsTab(tab);
+    setToolsOpen(true);
+  };
+
+  const getSearchIndex = async (): Promise<SearchIndexSection[]> => {
+    if (searchIndexRef.current) return searchIndexRef.current;
+    const book = bookRef.current;
+    if (!book) return [];
+    const items = book.spine?.spineItems ?? [];
+    const currentHref = (renditionRef.current?.currentLocation?.()?.start?.href ?? "").split("#")[0];
+    const sections: SearchIndexSection[] = [];
+    setSearchTotal(items.length);
+    setSearchDone(0);
+
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      try {
+        await item.load(book.load.bind(book));
+        const text = collectSectionText(item.document);
+        if (text.trim().length > 0) {
+          sections.push({
+            index,
+            href: item.href,
+            chapter: findLabel(tocRef.current, item.href) || "正文",
+            text,
+          });
+        }
+        if (item.href.split("#")[0] !== currentHref && typeof item.unload === "function") {
+          item.unload();
+        }
+      } catch {
+        // A single broken section should not stop the whole search.
+      }
+      setSearchDone(index + 1);
+      if (index % 8 === 0) {
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      }
+    }
+
+    searchIndexRef.current = sections;
+    return sections;
+  };
+
+  const runSearch = async () => {
+    const term = searchQuery.trim();
+    if (term.length < 2 || !bookRef.current) return;
+    const runId = ++searchRunRef.current;
+    setSearching(true);
+    setSearchHasRun(false);
+    setSearchResults([]);
+    setSearchTotalHits(0);
+
+    try {
+      const sections = await getSearchIndex();
+      if (runId !== searchRunRef.current) return;
+      const needle = term.toLowerCase();
+      const results: SearchResult[] = [];
+      let total = 0;
+
+      for (const section of sections) {
+        const haystack = section.text.toLowerCase();
+        let from = 0;
+        let occurrence = 0;
+        while (from < haystack.length) {
+          const position = haystack.indexOf(needle, from);
+          if (position < 0) break;
+          total += 1;
+          if (results.length < 100) {
+            const start = Math.max(0, position - 34);
+            const end = Math.min(section.text.length, position + term.length + 54);
+            results.push({
+              id: `${section.index}-${occurrence}`,
+              sectionIndex: section.index,
+              href: section.href,
+              chapter: section.chapter,
+              snippet: section.text.slice(start, end).replace(/\s+/g, " ").trim(),
+              occurrence,
+              query: term,
+            });
+          }
+          occurrence += 1;
+          from = position + Math.max(1, needle.length);
+          if (total >= 2000) break;
+        }
+        if (total >= 2000) break;
+      }
+
+      if (runId !== searchRunRef.current) return;
+      setSearchResults(results);
+      setSearchTotalHits(total);
+      setSearchHasRun(true);
+    } catch {
+      if (runId === searchRunRef.current) {
+        setSearchHasRun(true);
+        setSearchTotalHits(0);
+      }
+    } finally {
+      if (runId === searchRunRef.current) setSearching(false);
+    }
+  };
+
+  const jumpToSearchResult = async (result: SearchResult) => {
+    const book = bookRef.current;
+    const rendition = renditionRef.current;
+    if (!book || !rendition) return;
+    try {
+      const item = book.spine?.spineItems?.[result.sectionIndex];
+      if (item) {
+        await item.load(book.load.bind(book));
+        const { text, nodes } = collectTextNodes(item.document);
+        const position = findNthMatch(text, result.query, result.occurrence);
+        if (position >= 0) {
+          const start = locateOffset(nodes, position);
+          const end = locateOffset(nodes, position + result.query.length);
+          if (start && end) {
+            const range = item.document.createRange();
+            range.setStart(start.node, start.offset);
+            range.setEnd(end.node, end.offset);
+            const cfi = item.cfiFromRange(range);
+            await jumpToCfi(cfi);
+            setToolsOpen(false);
+            return;
+          }
+        }
+      }
+      await rendition.display(result.href);
+      setToolsOpen(false);
+    } catch {
+      await rendition.display(result.href).catch(() => undefined);
+      setToolsOpen(false);
+    }
+  };
+
+  const addBookmark = () => {
+    const rendition = renditionRef.current;
+    const location = rendition?.currentLocation?.();
+    const cfi = (isScrollMode ? currentScrollCfi() : "") || location?.start?.cfi;
+    if (!cfi) return;
+    if (bookmarks.some((bookmark) => bookmark.cfi === cfi)) {
+      setToolsTab("bookmarks");
+      return;
+    }
+    let percent = percentRef.current;
+    let anchorHref = "";
+    let anchorOffset: number | undefined;
+    if (isScrollMode) {
+      const scroller = viewerRef.current?.querySelector<HTMLElement>(".epub-container");
+      if (scroller) {
+        const max = Math.max(1, scroller.scrollHeight - scroller.clientHeight);
+        percent = Math.min(1, Math.max(0, scroller.scrollTop / max));
+        const probe = scroller.getBoundingClientRect().top + scroller.clientHeight * 0.32;
+        const frames = Array.from(
+          viewerRef.current?.querySelectorAll<HTMLIFrameElement>(".reader__viewport iframe") ?? [],
+        );
+        const frame = frames.find((item) => {
+          const rect = item.getBoundingClientRect();
+          return rect.top <= probe && rect.bottom >= probe;
+        });
+        const view = frame?.closest<HTMLElement>(".epub-view");
+        if (frame && view) {
+          anchorHref =
+            currentHrefRef.current ||
+            (frame.contentDocument?.baseURI ?? "").split("/").pop() ||
+            "";
+          anchorOffset = Math.max(0, scroller.scrollTop - view.offsetTop);
+        }
+      }
+    }
+    const next = [
+      ...bookmarks,
+      {
+        id: newBookmarkId(),
+        cfi,
+        percent,
+        chapter: currentLabel,
+        createdAt: Date.now(),
+        href: anchorHref || undefined,
+        offset: anchorOffset,
+      },
+    ];
+    setBookmarks(next);
+    saveBookmarks(meta.id, next);
+    setToolsTab("bookmarks");
+  };
+
+  const jumpToBookmark = async (bookmark: Bookmark) => {
+    collapseChrome();
+    const rendition = renditionRef.current;
+    if (!rendition) return;
+    setToolsOpen(false);
+    if (isScrollMode) {
+      const applyAnchor = () => {
+        if (!bookmark.href || typeof bookmark.offset !== "number") return false;
+        const frame = frameForHref(bookmark.href);
+        const view = frame?.closest<HTMLElement>(".epub-view");
+        const scroller = viewerRef.current?.querySelector<HTMLElement>(".epub-container");
+        if (!view || !scroller) return false;
+        scroller.scrollTop = Math.max(0, view.offsetTop + bookmark.offset);
+        return true;
+      };
+      if (applyAnchor()) return;
+      if (bookmark.href && typeof bookmark.offset === "number") {
+        await rendition.display(bookmark.cfi).catch(() => undefined);
+        window.setTimeout(applyAnchor, 250);
+        window.setTimeout(applyAnchor, 800);
+        return;
+      }
+      // Older bookmarks only have a percent; use it as a best effort.
+      const scroller = viewerRef.current?.querySelector<HTMLElement>(".epub-container");
+      if (scroller) {
+        const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        scroller.scrollTop = Math.min(max, Math.max(0, bookmark.percent * max));
+        return;
+      }
+    }
+    await jumpToCfi(bookmark.cfi);
+  };
+
+  const deleteBookmark = (id: string) => {
+    const next = bookmarks.filter((bookmark) => bookmark.id !== id);
+    setBookmarks(next);
+    saveBookmarks(meta.id, next);
+  };
+
+  const clearIframeSelection = () => {
+    const rendition = renditionRef.current;
+    const contents = rendition?.getContents?.() ?? [];
+    for (const content of Array.isArray(contents) ? contents : [contents]) {
+      try {
+        content?.document?.getSelection?.()?.removeAllRanges();
+      } catch {
+        // Ignore selections from detached sections.
+      }
+    }
+  };
+
+  const addHighlight = (color: HighlightColor, note: string) => {
+    if (!selection) return;
+    const now = Date.now();
+    const existing = highlights.find((item) => item.cfi === selection.cfi);
+    const next = existing
+      ? highlights.map((item) =>
+          item.id === existing.id
+            ? {
+                ...item,
+                color,
+                note: note || item.note,
+                text: selection.text,
+                chapter: selection.chapter,
+                updatedAt: now,
+              }
+            : item,
+        )
+      : [
+          ...highlights,
+          {
+            id: newHighlightId(),
+            cfi: selection.cfi,
+            text: selection.text,
+            chapter: selection.chapter,
+            percent: selection.percent,
+            color,
+            note,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ];
+    highlightsRef.current = next;
+    setHighlights(next);
+    saveHighlights(meta.id, next);
+    setSelection(null);
+    clearIframeSelection();
+    window.setTimeout(() => applyHighlightsRef.current?.(), 30);
+    setToolsTab("highlights");
+    if (note) setToolsOpen(true);
+  };
+
+  const deleteHighlight = (id: string) => {
+    const target = highlights.find((item) => item.id === id);
+    if (!target) return;
+    const next = highlights.filter((item) => item.id !== id);
+    highlightsRef.current = next;
+    setHighlights(next);
+    saveHighlights(meta.id, next);
+    try {
+      renditionRef.current?.annotations?.remove(target.cfi, "highlight");
+    } catch {
+      // The section may already be closed.
+    }
+  };
+
+  const saveHighlightNote = (id: string, note: string) => {
+    const next = highlights.map((item) =>
+      item.id === id ? { ...item, note: note.trim(), updatedAt: Date.now() } : item,
+    );
+    highlightsRef.current = next;
+    setHighlights(next);
+    saveHighlights(meta.id, next);
+  };
+
+  const jumpToHighlight = async (highlight: Highlight) => {
+    const rendition = renditionRef.current;
+    if (!rendition) return;
+    setToolsOpen(false);
+    setSelection(null);
+    await jumpToCfi(highlight.cfi);
+  };
+
+  const importCustomFont = async (file: File) => {
+    const name = file.name.toLowerCase();
+    if (!/\.(ttf|otf|woff2?|ttc)$/.test(name)) {
+      throw new Error("请选择 TTF、OTF、WOFF 或 WOFF2 字体文件");
+    }
+    if (file.size > 30 * 1024 * 1024) {
+      throw new Error("字体文件不能超过 30MB");
+    }
+    const data = await file.arrayBuffer();
+    const id = `font-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const displayName = file.name.replace(/\.[^.]+$/, "");
+    await putFont({ id, name: displayName, data, createdAt: Date.now() });
+    const previous = settings.customFontId;
+    onSettingsChange({ customFontId: id, customFontName: displayName });
+    if (previous && previous !== id) {
+      void deleteFont(previous).catch(() => undefined);
+    }
+  };
+
+  const removeCustomFont = () => {
+    const id = settings.customFontId;
+    onSettingsChange({ customFontId: undefined, customFontName: undefined });
+    if (id) void deleteFont(id).catch(() => undefined);
+  };
+
+  const importBackground = async (file: File) => {
+    if (!/^image\/(jpeg|png|webp|gif)$/i.test(file.type)) {
+      throw new Error("请选择 JPG、PNG、WebP 或 GIF 图片");
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      throw new Error("背景图片不能超过 20MB");
+    }
+    const data = await file.arrayBuffer();
+    const id = `bg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const name = file.name.replace(/\.[^.]+$/, "");
+    await putBackground({
+      id,
+      name,
+      data,
+      type: file.type,
+      createdAt: Date.now(),
+    });
+    const previous = settings.backgroundImageId;
+    onSettingsChange({
+      backgroundImageId: id,
+      backgroundImageName: name,
+      theme: "custom",
+    });
+    if (previous && previous !== id) {
+      void deleteBackground(previous).catch(() => undefined);
+    }
+  };
+
+  const removeBackground = () => {
+    const id = settings.backgroundImageId;
+    onSettingsChange({ backgroundImageId: undefined, backgroundImageName: undefined });
+    if (id) void deleteBackground(id).catch(() => undefined);
+  };
+
+  return (
+    <section
+      className={`reader reader--${settings.readingMode} ${backgroundUrl ? "reader--custom-bg" : ""} ${chromeHidden ? "reader--chrome-hidden" : ""} ${tocOpen || settingsOpen || toolsOpen || ttsOpen ? "reader--panel-open" : ""}`}
+      style={backgroundUrl ? { backgroundImage: `url("${backgroundUrl}")` } : undefined}
+      onClick={(event) => {
+        if (!IS_ANDROID) return;
+        const target = event.target as HTMLElement;
+        if (
+          target.closest(
+            "button, input, textarea, a, .drawer, .drawer-backdrop, .selection-toolbar, .page-flip, .reader__loading, .reader__error",
+          )
+        ) {
+          return;
+        }
+        if (!chromeHidden) {
+          setChromeHidden(true);
+          setShowTapHint(false);
+          return;
+        }
+        if (settings.readingMode !== "scroll") {
+          const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+          const x = event.clientX - rect.left;
+          if (x < rect.width * 0.3) {
+            turnPageRef.current("prev");
+            return;
+          }
+          if (x > rect.width * 0.7) {
+            turnPageRef.current("next");
+            return;
+          }
+        }
+        setChromeHidden((visible) => !visible);
+        setShowTapHint(false);
+      }}
+    >
+      <header className="reader__topbar">
+        <button className="icon-button icon-button--quiet" onClick={onBack} aria-label="回到书架">
+          <Icon name="arrow-left" size={20} />
+        </button>
+        {showSidebarToggle ? (
+          <button
+            className={`icon-button icon-button--quiet desktop-only ${sidebarHidden ? "icon-button--active" : ""}`}
+            onClick={onToggleSidebar}
+            aria-label={sidebarHidden ? "显示书架" : "隐藏书架"}
+            title={sidebarHidden ? "显示书架 (Ctrl+B)" : "隐藏书架 (Ctrl+B)"}
+          >
+            <Icon name="sidebar" size={19} />
+          </button>
+        ) : null}
+        <div className="reader__identity">
+          <span className="reader__title">{meta.title}</span>
+          <span className="reader__author">{meta.author}</span>
+        </div>
+        <div className="reader__chapter-label">
+          <span>{currentLabel}</span>
+        </div>
+        <div className="reader__tools">
+          <button
+            className={`icon-button ${toolsOpen ? "icon-button--active" : ""}`}
+            onClick={() => {
+              if (toolsOpen) setToolsOpen(false);
+              else openTools("search");
+            }}
+            title="全文搜索 (Ctrl+F)"
+            aria-label="全文搜索"
+          >
+            <Icon name="search" size={19} />
+          </button>
+          <button
+            className={`icon-button ${toolsOpen && toolsTab === "highlights" ? "icon-button--active" : ""}`}
+            onClick={() => {
+              if (toolsOpen && toolsTab === "highlights") setToolsOpen(false);
+              else openTools("highlights");
+            }}
+            title="划线与笔记"
+            aria-label="划线与笔记"
+          >
+            <Icon name="pen" size={18} />
+          </button>
+          <button
+            className="icon-button desktop-only"
+            onClick={onToggleTheme}
+            title={`切换主题（当前：${themeLabel}）`}
+            aria-label={`切换主题，当前${themeLabel}`}
+          >
+            <Icon name={themeIcon} size={19} />
+          </button>
+          <button
+            className="icon-button desktop-only"
+            onClick={onOpenMusic}
+            title="音乐"
+            aria-label="打开音乐"
+          >
+            <Icon name="music" size={19} />
+          </button>
+          <button
+            className={`icon-button desktop-only ${ttsOpen ? "icon-button--active" : ""}`}
+            onClick={() => {
+              setTocOpen(false);
+              setSettingsOpen(false);
+              setTtsOpen((open) => !open);
+            }}
+            aria-label="听书"
+            title="听书"
+            disabled={!ready}
+          >
+            <Icon name="headphones" size={19} />
+          </button>
+          <button
+            className="icon-button desktop-only"
+            onClick={onChangeCover}
+            title="更换封面"
+            aria-label="更换封面"
+          >
+            <Icon name="image" size={19} />
+          </button>
+          <button
+            className={`icon-button ${tocOpen ? "icon-button--active" : ""}`}
+            onClick={() => {
+              setSettingsOpen(false);
+              setTtsOpen(false);
+              setTocOpen((open) => !open);
+            }}
+            aria-label="目录"
+            title="目录"
+          >
+            <Icon name="list" size={19} />
+          </button>
+          <button
+            className={`icon-button ${settingsOpen ? "icon-button--active" : ""}`}
+            onClick={() => {
+              setTocOpen(false);
+              setTtsOpen(false);
+              setSettingsOpen((open) => !open);
+            }}
+            aria-label="阅读设置"
+            title="阅读设置"
+          >
+            <Icon name="settings" size={19} />
+          </button>
+        </div>
+      </header>
+
+      <div
+        className={`reader__stage page-effect-${settings.pageEffect} ${flip ? `is-turning is-turning--${flip}` : ""}`}
+      >
+        <div ref={viewerRef} className="reader__viewport" />
+
+        {flip ? (
+          <div
+            key={`${flip}-${flipNonce}`}
+            className={`page-flip page-flip--${flip} page-flip--effect-${settings.pageEffect}`}
+            aria-hidden="true"
+          />
+        ) : null}
+
+        {!ready && !error ? (
+          <div className="reader__loading">
+            <span className="spinner" />
+            <p>正在展开书页…</p>
+          </div>
+        ) : null}
+
+        {error ? (
+          <div className="reader__error">
+            <Icon name="book" size={34} />
+            <h3>书页没有展开</h3>
+            <p>{error}</p>
+            <button className="button button--primary" onClick={onBack}>
+              回到书架
+            </button>
+          </div>
+        ) : null}
+
+        {tocOpen ? (
+          <>
+            <div className="drawer-backdrop" onClick={() => setTocOpen(false)} />
+            <TocPanel
+              toc={toc}
+              currentHref={currentHref}
+              onSelect={jumpTo}
+              onClose={() => setTocOpen(false)}
+            />
+          </>
+        ) : null}
+
+        {settingsOpen ? (
+          <>
+            <div className="drawer-backdrop" onClick={() => setSettingsOpen(false)} />
+            <SettingsPanel
+              settings={settings}
+              onChange={onSettingsChange}
+              onImportFont={importCustomFont}
+              onRemoveFont={removeCustomFont}
+              onImportBackground={importBackground}
+              onRemoveBackground={removeBackground}
+              onClose={() => setSettingsOpen(false)}
+            />
+          </>
+        ) : null}
+
+        {toolsOpen ? (
+          <>
+            <div className="drawer-backdrop" onClick={() => setToolsOpen(false)} />
+            <ReaderToolsPanel
+              open={toolsOpen}
+              tab={toolsTab}
+              onTabChange={setToolsTab}
+              query={searchQuery}
+              onQueryChange={setSearchQuery}
+              onSearch={() => void runSearch()}
+              searching={searching}
+              searchDone={searchDone}
+              searchTotal={searchTotal}
+              searchResults={searchResults}
+              searchHasRun={searchHasRun}
+              searchTotalHits={searchTotalHits}
+              currentChapter={currentLabel}
+              bookmarks={bookmarks}
+              highlights={highlights}
+              onJumpSearch={(result) => void jumpToSearchResult(result)}
+              onAddBookmark={addBookmark}
+              onJumpBookmark={(bookmark) => void jumpToBookmark(bookmark)}
+              onDeleteBookmark={deleteBookmark}
+              onJumpHighlight={(highlight) => void jumpToHighlight(highlight)}
+              onDeleteHighlight={deleteHighlight}
+              onSaveHighlightNote={saveHighlightNote}
+              onClose={() => setToolsOpen(false)}
+            />
+          </>
+        ) : null}
+      </div>
+
+      {selection ? (
+        <SelectionToolbar
+          left={selection.left}
+          top={selection.top}
+          onHighlight={addHighlight}
+          onClose={() => setSelection(null)}
+        />
+      ) : null}
+
+      {IS_ANDROID && showTapHint ? (
+        <div className="reader__tap-hint">轻点正文显示菜单</div>
+      ) : null}
+
+      <footer className="reader__footer">
+        {isScrollMode ? (
+          <span className="reader__scroll-hint">
+            <Icon name="chevron-down" size={15} />
+            一镜到底
+          </span>
+        ) : (
+          <button className="page-button" onClick={() => void turnPage("prev")} aria-label="上一页">
+            <Icon name="left" size={18} />
+            <span>上一页</span>
+          </button>
+        )}
+
+        <div className="reader__progress">
+          <span className="reader__percent">{percentLabel(percent)}</span>
+          <input
+            className="progress-range"
+            type="range"
+            min={0}
+            max={1000}
+            value={Math.round(percent * 1000)}
+            onChange={(event) => seek(Number(event.target.value))}
+            disabled={!locationsReady && toc.length === 0}
+            aria-label="阅读进度"
+          />
+          <span className="reader__chapter-small">{currentLabel}</span>
+        </div>
+
+        <div className="reader__footer-actions">
+          {isScrollMode ? (
+            <span className="reader__scroll-hint reader__scroll-hint--right">
+              滚轮 / 触控板
+            </span>
+          ) : null}
+          <button
+            className="page-button page-button--chapter"
+            onClick={() => void goToPrevChapter()}
+            aria-label="上一章"
+            title="上一章"
+            disabled={!hasPrevChapter}
+          >
+            <Icon name="skip-back" size={16} />
+            <span>上一章</span>
+          </button>
+          <button
+            className="page-button page-button--chapter"
+            onClick={() => void goToNextChapter()}
+            aria-label="下一章"
+            title="下一章"
+            disabled={!hasNextChapter}
+          >
+            <span>下一章</span>
+            <Icon name="skip-forward" size={16} />
+          </button>
+          {isScrollMode ? null : (
+            <button className="page-button" onClick={() => void turnPage("next")} aria-label="下一页">
+              <span>下一页</span>
+              <Icon name="right" size={18} />
+            </button>
+          )}
+        </div>
+
+        {IS_ANDROID ? (
+          <div className="reader__mobile-actions">
+            <button type="button" onClick={() => openTools("search")}>
+              <Icon name="search" size={20} />
+              <span>搜索</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setSettingsOpen(false);
+                setToolsOpen(false);
+                setTtsOpen(false);
+                setTocOpen(true);
+              }}
+            >
+              <Icon name="list" size={20} />
+              <span>目录</span>
+            </button>
+            <button type="button" onClick={() => openTools("highlights")}>
+              <Icon name="pen" size={20} />
+              <span>笔记</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setTocOpen(false);
+                setToolsOpen(false);
+                setTtsOpen(false);
+                setSettingsOpen(true);
+              }}
+            >
+              <Icon name="settings" size={20} />
+              <span>设置</span>
+            </button>
+          </div>
+        ) : null}
+      </footer>
+
+      <TtsPlayer
+        open={ttsOpen}
+        onOpen={() => setTtsOpen(true)}
+        onClose={() => setTtsOpen(false)}
+        chapterLabel={currentLabel}
+        loadCurrentChapter={loadCurrentChapterText}
+        loadNextChapter={loadNextChapterText}
+        onSentence={(chapter, start, length) =>
+          void highlightTtsSentence(chapter, start, length)
+        }
+        onStop={clearTtsHighlight}
+      />
+    </section>
+  );
+}
+
+function collectSectionText(document?: Document): string {
+  return collectTextNodes(document).text;
+}
+
+interface TextNodePosition {
+  node: Text;
+  start: number;
+  end: number;
+}
+
+function collectTextNodes(document?: Document): { text: string; nodes: TextNodePosition[] } {
+  if (!document?.body) return { text: "", nodes: [] };
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (parent && ["SCRIPT", "STYLE", "NOSCRIPT"].includes(parent.tagName)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const nodes: TextNodePosition[] = [];
+  let text = "";
+  let current = walker.nextNode();
+  while (current) {
+    const value = current.textContent ?? "";
+    if (value) {
+      nodes.push({
+        node: current as Text,
+        start: text.length,
+        end: text.length + value.length,
+      });
+      text += value;
+    }
+    current = walker.nextNode();
+  }
+  return { text, nodes };
+}
+
+function findNthMatch(text: string, query: string, occurrence: number): number {
+  const haystack = text.toLowerCase();
+  const needle = query.toLowerCase();
+  if (!needle) return -1;
+  let from = 0;
+  let count = 0;
+  while (from < haystack.length) {
+    const position = haystack.indexOf(needle, from);
+    if (position < 0) return -1;
+    if (count === occurrence) return position;
+    count += 1;
+    from = position + Math.max(1, needle.length);
+  }
+  return -1;
+}
+
+function locateOffset(
+  nodes: TextNodePosition[],
+  offset: number,
+): { node: Text; offset: number } | null {
+  for (const entry of nodes) {
+    if (offset >= entry.start && offset <= entry.end) {
+      return { node: entry.node, offset: Math.min(entry.end - entry.start, offset - entry.start) };
+    }
+  }
+  return null;
+}
+
+function getVisibleTextOffset(
+  document: Document | undefined,
+  nodes: TextNodePosition[],
+): number | null {
+  const view = document?.defaultView;
+  if (!document || !view) return null;
+  const frame = view.frameElement as HTMLIFrameElement | null;
+  const frameRect = frame?.getBoundingClientRect();
+  const viewport = frame?.closest(".reader__viewport")?.getBoundingClientRect();
+  const left = frameRect
+    ? Math.max(0, (viewport?.left ?? frameRect.left) - frameRect.left)
+    : 0;
+  const right = frameRect
+    ? Math.min(frameRect.width, (viewport?.right ?? frameRect.right) - frameRect.left)
+    : view.innerWidth;
+  const top = frameRect
+    ? Math.max(0, (viewport?.top ?? frameRect.top) - frameRect.top)
+    : 0;
+  const bottom = frameRect
+    ? Math.min(frameRect.height, (viewport?.bottom ?? frameRect.bottom) - frameRect.top)
+    : view.innerHeight;
+  if (right <= left || bottom <= top) return null;
+
+  const visible: { entry: TextNodePosition; rect: DOMRect }[] = [];
+  for (const entry of nodes) {
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(entry.node);
+      for (const rect of Array.from(range.getClientRects())) {
+        if (
+          rect.width > 1 &&
+          rect.height > 1 &&
+          rect.bottom > top &&
+          rect.top < bottom &&
+          rect.right > left &&
+          rect.left < right
+        ) {
+          visible.push({ entry, rect });
+        }
+      }
+    } catch {
+      // Ignore detached or non-renderable nodes.
+    }
+  }
+  visible.sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+
+  for (const item of visible) {
+    const x = Math.max(left, Math.min(right - 1, item.rect.left + 2));
+    const y = Math.max(top, Math.min(bottom - 1, item.rect.top + item.rect.height / 2));
+    const caret = document.caretRangeFromPoint(x, y);
+    if (caret?.startContainer.nodeType === Node.TEXT_NODE) {
+      const entry = nodes.find((node) => node.node === caret.startContainer);
+      if (entry) return entry.start + caret.startOffset;
+    }
+  }
+  return null;
+}
+
+function mapToc(items: RawNavItem[]): TocEntry[] {
+  return items
+    .filter((item) => Boolean(item.href))
+    .map((item) => ({
+      href: item.href ?? "",
+      label: cleanLabel(item.label ?? ""),
+      children: item.subitems?.length ? mapToc(item.subitems) : undefined,
+    }));
+}
+
+function flattenToc(items: TocEntry[]): TocEntry[] {
+  const flat: TocEntry[] = [];
+  const walk = (entries: TocEntry[]) => {
+    for (const entry of entries) {
+      flat.push(entry);
+      if (entry.children?.length) walk(entry.children);
+    }
+  };
+  walk(items);
+  return flat;
+}
+
+function cleanLabel(label: string): string {
+  if (!label) return "";
+  try {
+    const doc = new DOMParser().parseFromString(label, "text/html");
+    return (doc.body.textContent ?? label).replace(/\s+/g, " ").trim();
+  } catch {
+    return label.replace(/<[^>]*>/g, "").trim();
+  }
+}
+
+function findLabel(items: TocEntry[], href: string): string | undefined {
+  const base = href.split("#")[0];
+  for (const item of items) {
+    if (item.href.split("#")[0] === base) return item.label;
+    const child = findLabel(item.children ?? [], href);
+    if (child) return child;
+  }
+  return undefined;
+}
+
+function findHrefByLabel(items: TocEntry[], label: string): string | undefined {
+  for (const item of items) {
+    if (item.label === label) return item.href;
+    const child = findHrefByLabel(item.children ?? [], label);
+    if (child) return child;
+  }
+  return undefined;
+}
+
+function applyReaderTheme(
+  rendition: any,
+  settings: ReaderSettings,
+  customFontUrl?: string | null,
+): void {
+  if (!rendition?.themes) return;
+  const palette = readerPalette(settings);
+  const bodyBackground = settings.backgroundImageId
+    ? hexToRgba(palette.background, Math.max(0.2, 1 - settings.backgroundDim))
+    : palette.background;
+  const baseFamily =
+    settings.fontFamily === "sans"
+      ? '"Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", sans-serif'
+      : '"Noto Serif CJK SC", "Songti SC", "Source Han Serif SC", SimSun, Georgia, serif';
+  const family = customFontUrl
+    ? `"MoyueCustom", ${baseFamily}`
+    : baseFamily;
+
+  // Many Chinese system fonts only ship regular and bold faces. Intermediate
+  // weights would otherwise look identical, so use a light text color for
+  // "细" and a tiny text stroke to make "中等" visibly different.
+  const thinText =
+    settings.fontWeight === 300
+      ? `color-mix(in srgb, ${palette.text} 82%, ${palette.background})`
+      : palette.text;
+  const weightStroke = settings.fontWeight === 500 ? "0.35px" : "0px";
+
+  const rules = {
+    "html": {
+      "background-color": settings.backgroundImageId
+        ? "transparent !important"
+        : `${palette.background} !important`,
+      "color": `${palette.text} !important`,
+    },
+    body: {
+      "background-color": `${bodyBackground} !important`,
+      "color": `${palette.text} !important`,
+      "font-family": `${family} !important`,
+      "font-weight": `${settings.fontWeight} !important`,
+      "line-height": `${settings.lineHeight} !important`,
+      "padding": `0 ${settings.margin}px !important`,
+      "writing-mode": settings.vertical ? "vertical-rl !important" : "horizontal-tb !important",
+      "text-orientation": settings.vertical ? "upright !important" : "mixed !important",
+    },
+    p: {
+      "line-height": `${settings.lineHeight} !important`,
+      "margin-bottom": `${settings.paragraphSpacing}em !important`,
+    },
+    "p, li, blockquote, td": {
+      "font-weight": `${settings.fontWeight} !important`,
+      "color": `${thinText} !important`,
+      "-webkit-text-stroke": `${weightStroke} currentColor !important`,
+    },
+    "a, a:visited": {
+      "color": `${palette.accent} !important`,
+    },
+    "::selection": {
+      "background": palette.selection,
+    },
+    "img, svg": {
+      "max-width": "100% !important",
+      "height": "auto !important",
+    },
+    "h1, h2, h3, h4": {
+      "color": `${palette.text} !important`,
+      "line-height": "1.4 !important",
+    },
+    "blockquote": {
+      "color": `${palette.muted} !important`,
+      "border-left-color": `${palette.accent} !important`,
+    },
+  };
+
+  try {
+    rendition.themes.register("moyue", rules);
+    rendition.themes.select("moyue");
+    rendition.themes.fontSize(`${settings.fontSize}px`);
+  } catch {
+    // The iframe may have been torn down between settings updates.
+  }
+}
+function injectCustomFont(document: Document | undefined, url: string | null): void {
+  if (!document || !url) return;
+  try {
+    let style = document.getElementById("moyue-custom-font") as HTMLStyleElement | null;
+    if (!style) {
+      style = document.createElement("style");
+      style.id = "moyue-custom-font";
+      document.head.appendChild(style);
+    }
+    style.textContent = `@font-face { font-family: "MoyueCustom"; src: url("${url}"); font-display: swap; }`;
+  } catch {
+    // Ignore iframes that are no longer accessible.
+  }
+}

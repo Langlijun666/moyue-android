@@ -1,0 +1,15 @@
+{
+  "productName": "Moyue Online",
+  "identifier": "com.moyue.reader.online",
+  "build": {
+    "beforeBuildCommand": "npm run build:online"
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://moyue-release-files.oss-cn-hangzhou.aliyuncs.com/updates/online/latest.json"
+      ]
+    }
+  },
+  "version": "0.33.3"
+}

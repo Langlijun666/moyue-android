@@ -1,0 +1,1365 @@
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::panic;
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use tauri::{Emitter, Manager};
+use tauri_plugin_updater::{Update, UpdaterExt};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[derive(Serialize)]
+struct AppInfo {
+    name: &'static str,
+    version: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MusicTrack {
+    file_name: String,
+    path: String,
+    size: u64,
+    modified: u64,
+}
+
+#[tauri::command]
+fn app_info() -> AppInfo {
+    AppInfo {
+        name: "墨阅",
+        version: env!("CARGO_PKG_VERSION"),
+    }
+}
+
+#[tauri::command]
+fn music_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let folder = music_folder(&app)?;
+    Ok(folder.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn list_music(app: tauri::AppHandle) -> Result<Vec<MusicTrack>, String> {
+    let folder = music_folder(&app)?;
+    let mut tracks = Vec::new();
+    collect_music(&folder, &mut tracks, 0);
+    tracks.sort_by(|a, b| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()));
+    Ok(tracks)
+}
+
+#[tauri::command]
+fn open_music_folder(app: tauri::AppHandle) -> Result<(), String> {
+    let folder = music_folder(&app)?;
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&folder)
+            .spawn()
+            .map_err(|error| format!("无法打开音乐文件夹：{error}"))?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Err("当前平台暂不支持自动打开文件夹".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn data_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let folder = app_data_folder(&app)?;
+    Ok(folder.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn open_data_folder(app: tauri::AppHandle) -> Result<(), String> {
+    let folder = app_data_folder(&app)?;
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&folder)
+            .spawn()
+            .map_err(|error| format!("无法打开数据文件夹：{error}"))?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Err("当前平台暂不支持自动打开文件夹".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn backup_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let folder = backup_folder(&app)?;
+    Ok(folder.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn open_backup_folder(app: tauri::AppHandle) -> Result<(), String> {
+    let folder = backup_folder(&app)?;
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&folder)
+            .spawn()
+            .map_err(|error| format!("无法打开备份文件夹：{error}"))?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Err("当前平台暂不支持自动打开文件夹".to_string());
+    }
+    Ok(())
+}
+
+const SPONSOR_ISSUE_URL: &str = "https://github.com/Langlijun666/moyue-reader/issues/new?template=sponsorship.yml&title=%5B%E8%B5%9E%E5%8A%A9%E7%99%BB%E8%AE%B0%5D%20";
+const BUG_ISSUE_URL: &str = "https://github.com/Langlijun666/moyue-reader/issues/new?template=bug_report.yml&title=%5B%E9%97%AE%E9%A2%98%5D%20";
+
+const OSS_UPDATE_ENDPOINT: &str =
+    "https://moyue-release-files.oss-cn-hangzhou.aliyuncs.com/updates/latest.json";
+const OSS_ONLINE_UPDATE_ENDPOINT: &str =
+    "https://moyue-release-files.oss-cn-hangzhou.aliyuncs.com/updates/online/latest.json";
+const GITHUB_UPDATE_ENDPOINT: &str =
+    "https://github.com/Langlijun666/moyue-reader/releases/download/latest-local/latest.json";
+const GITHUB_ONLINE_UPDATE_ENDPOINT: &str =
+    "https://github.com/Langlijun666/moyue-reader/releases/download/latest-online/latest-online.json";
+
+#[derive(Default)]
+struct UpdateStore(Mutex<Option<PendingUpdate>>);
+
+struct PendingUpdate {
+    update: Update,
+    bytes: Option<Vec<u8>>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfo {
+    version: String,
+    current_version: String,
+    body: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateProgress {
+    downloaded: u64,
+    total: u64,
+}
+
+#[tauri::command]
+async fn check_app_update(
+    app: tauri::AppHandle,
+    source: String,
+    store: tauri::State<'_, UpdateStore>,
+) -> Result<Option<UpdateInfo>, String> {
+    let online = app.config().identifier.ends_with(".online");
+    let oss_endpoint = if online {
+        OSS_ONLINE_UPDATE_ENDPOINT
+    } else {
+        OSS_UPDATE_ENDPOINT
+    };
+    let github_endpoint = if online {
+        GITHUB_ONLINE_UPDATE_ENDPOINT
+    } else {
+        GITHUB_UPDATE_ENDPOINT
+    };
+    let endpoint = match source.as_str() {
+        "mirror" => vec![oss_endpoint],
+        "github" => vec![github_endpoint],
+        // The default path must not mix the independent GitHub releases:
+        // the newest GitHub release may belong to the other edition.
+        _ => vec![oss_endpoint],
+    };
+    let urls = endpoint
+        .into_iter()
+        .filter_map(|value| value.parse::<tauri::Url>().ok())
+        .collect();
+    let updater = app
+        .updater_builder()
+        .endpoints(urls)
+        .map_err(|error| error.to_string())?
+        .build()
+        .map_err(|error| error.to_string())?;
+    let update = updater.check().await.map_err(|error| error.to_string())?;
+    match update {
+        Some(update) => {
+            let info = UpdateInfo {
+                version: update.version.clone(),
+                current_version: update.current_version.clone(),
+                body: update.body.clone().unwrap_or_default(),
+            };
+            *store.0.lock().map_err(|error| error.to_string())? = Some(PendingUpdate {
+                update,
+                bytes: None,
+            });
+            Ok(Some(info))
+        }
+        None => {
+            *store.0.lock().map_err(|error| error.to_string())? = None;
+            Ok(None)
+        }
+    }
+}
+
+#[tauri::command]
+async fn download_app_update(
+    app: tauri::AppHandle,
+    store: tauri::State<'_, UpdateStore>,
+) -> Result<(), String> {
+    let update = {
+        let guard = store.0.lock().map_err(|error| error.to_string())?;
+        guard
+            .as_ref()
+            .map(|pending| pending.update.clone())
+            .ok_or_else(|| "没有可下载的更新".to_string())?
+    };
+    let app_for_progress = app.clone();
+    let mut received = 0u64;
+    let mut last_emit = std::time::Instant::now();
+    let mut last_percent = 0u64;
+    let mut started = false;
+    let bytes = update
+        .download(
+            move |chunk_length, total| {
+                received += chunk_length as u64;
+                let total = total.unwrap_or(0);
+                let percent = if total > 0 {
+                    received.saturating_mul(100) / total
+                } else {
+                    0
+                };
+                let finished = total > 0 && received >= total;
+                // Throttle progress events so the pill does not flicker:
+                // emit on a new whole percent (at most ~12 times a second)
+                // and always once the download is complete.
+                if started
+                    && !finished
+                    && (percent == last_percent || last_emit.elapsed().as_millis() < 80)
+                {
+                    return;
+                }
+                started = true;
+                last_percent = percent;
+                last_emit = std::time::Instant::now();
+                let _ = app_for_progress.emit(
+                    "moyue-update-progress",
+                    UpdateProgress {
+                        downloaded: received,
+                        total,
+                    },
+                );
+            },
+            || {},
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut guard = store.0.lock().map_err(|error| error.to_string())?;
+    let pending = guard
+        .as_mut()
+        .ok_or_else(|| "更新状态已失效".to_string())?;
+    pending.bytes = Some(bytes);
+    Ok(())
+}
+
+#[tauri::command]
+fn install_app_update(app: tauri::AppHandle, store: tauri::State<'_, UpdateStore>) -> Result<(), String> {
+    let (update, bytes) = {
+        let mut guard = store.0.lock().map_err(|error| error.to_string())?;
+        let pending = guard
+            .take()
+            .ok_or_else(|| "没有可安装的更新".to_string())?;
+        let bytes = pending
+            .bytes
+            .ok_or_else(|| "更新尚未下载完成".to_string())?;
+        (pending.update, bytes)
+    };
+    update.install(bytes).map_err(|error| error.to_string())?;
+    app.restart();
+}
+
+const FEATURE_ISSUE_URL: &str = "https://github.com/Langlijun666/moyue-reader/issues/new?template=feature_request.yml&title=%5B%E5%BB%BA%E8%AE%AE%5D%20";
+const FEEDBACK_EMAIL: &str = "xuxinyang121@gmail.com";
+
+const SHERPA_ENGINE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-win-x64-shared-MD-Release.tar.bz2";
+const SHERPA_ENGINE_MIRROR: &str = "https://moyue-release-files.oss-cn-hangzhou.aliyuncs.com/tts/sherpa-onnx.tar.bz2";
+const SHERPA_ENGINE_SHA256: &str = "ce987d5bfca42c74b54f7b3bbaaa8c1febe3c5cd0fea8f94be80ea30e72f1f61";
+const SHERPA_MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-melo-tts-zh_en.tar.bz2";
+const SHERPA_MODEL_MIRROR: &str = "https://moyue-release-files.oss-cn-hangzhou.aliyuncs.com/tts/vits-melo-tts-zh_en.tar.bz2";
+const SHERPA_MODEL_SHA256: &str = "e58351ed7149f290a54534538badd4077cdbe6fddc964b24d0bee870415d1514";
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NeuralStatus {
+    installed: bool,
+    directory: String,
+    bytes: u64,
+    message: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NeuralProgress {
+    stage: String,
+    downloaded: u64,
+    total: u64,
+    percent: f64,
+    message: String,
+}
+
+#[tauri::command]
+fn neural_status(app: tauri::AppHandle) -> Result<NeuralStatus, String> {
+    let folder = neural_folder(&app)?;
+    let engine = neural_engine_path(&folder);
+    let model = neural_model_path(&folder);
+    let installed = engine.exists() && model.exists();
+    let bytes = folder_size(&folder);
+    Ok(NeuralStatus {
+        installed,
+        directory: folder.to_string_lossy().into_owned(),
+        bytes,
+        message: if installed {
+            "离线自然语音已就绪".to_string()
+        } else {
+            "尚未下载离线自然语音".to_string()
+        },
+    })
+}
+
+#[tauri::command]
+async fn download_neural(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || download_neural_blocking(app))
+        .await
+        .map_err(|error| format!("下载任务失败：{error}"))?
+}
+
+#[tauri::command]
+fn remove_neural(app: tauri::AppHandle) -> Result<(), String> {
+    let folder = neural_folder(&app)?;
+    fs::remove_dir_all(&folder).map_err(|error| format!("无法删除离线语音：{error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn sherpa_speak(app: tauri::AppHandle, text: String, speed: f64) -> Result<String, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("没有可朗读的文字".to_string());
+    }
+    if trimmed.chars().count() > 500 {
+        return Err("朗读文本过长".to_string());
+    }
+
+    let folder = neural_folder(&app)?;
+    let engine = neural_engine_path(&folder);
+    let model = neural_model_path(&folder);
+    if !engine.exists() || !model.exists() {
+        return Err("离线自然语音尚未下载".to_string());
+    }
+
+    let cache = folder.join("cache");
+    fs::create_dir_all(&cache).map_err(|error| format!("无法创建语音缓存：{error}"))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let output = cache.join(format!("tts-{stamp}.wav"));
+    let bin_dir = engine.parent().ok_or_else(|| "无法定位语音引擎".to_string())?;
+    let model_dir = model
+        .parent()
+        .ok_or_else(|| "无法定位离线语音模型".to_string())?;
+
+    let mut command = Command::new(&engine);
+    command
+        .current_dir(bin_dir)
+        .arg(format!("--vits-model={}", model.to_string_lossy()))
+        .arg(format!(
+            "--vits-lexicon={}",
+            model_dir.join("lexicon.txt").to_string_lossy()
+        ))
+        .arg(format!(
+            "--vits-tokens={}",
+            model_dir.join("tokens.txt").to_string_lossy()
+        ))
+        .arg("--num-threads=4")
+        .arg(format!("--speed={}", speed.clamp(0.5, 2.0)))
+        .arg(format!("--output-filename={}", output.to_string_lossy()))
+        .arg(trimmed);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let result = command
+        .output()
+        .map_err(|error| format!("无法启动离线语音：{error}"))?;
+
+    if !result.status.success() || !output.exists() {
+        let detail = String::from_utf8_lossy(&result.stderr);
+        eprintln!("sherpa tts failed: {}", detail.trim());
+        return Err("离线语音合成失败，请重试".to_string());
+    }
+    prune_cache(&cache, 40);
+    Ok(output.to_string_lossy().into_owned())
+}
+
+fn download_neural_blocking(app: tauri::AppHandle) -> Result<(), String> {
+    let folder = neural_folder(&app)?;
+    let downloads = folder.join("_downloads");
+    fs::create_dir_all(&downloads).map_err(|error| error.to_string())?;
+
+    let engine_archive = downloads.join("sherpa-onnx.tar.bz2");
+    let model_archive = downloads.join("vits-melo-tts-zh_en.tar.bz2");
+
+    download_with_fallback(
+        &app,
+        &[SHERPA_ENGINE_URL, SHERPA_ENGINE_MIRROR],
+        &engine_archive,
+        SHERPA_ENGINE_SHA256,
+        "engine",
+        "下载离线语音引擎",
+    )?;
+    download_with_fallback(
+        &app,
+        &[SHERPA_MODEL_URL, SHERPA_MODEL_MIRROR],
+        &model_archive,
+        SHERPA_MODEL_SHA256,
+        "model",
+        "下载中文自然语音模型",
+    )?;
+
+    emit_neural_progress(&app, "extract", 0, 0, 0.0, "正在解压语音引擎…");
+    let engine_dir = folder.join("engine");
+    if engine_dir.exists() {
+        fs::remove_dir_all(&engine_dir).map_err(|error| error.to_string())?;
+    }
+    fs::create_dir_all(&engine_dir).map_err(|error| error.to_string())?;
+    extract_tar(&engine_archive, &engine_dir)?;
+
+    emit_neural_progress(&app, "extract", 0, 0, 0.0, "正在解压中文语音模型…");
+    let model_dir = folder.join("model");
+    if model_dir.exists() {
+        fs::remove_dir_all(&model_dir).map_err(|error| error.to_string())?;
+    }
+    fs::create_dir_all(&model_dir).map_err(|error| error.to_string())?;
+    extract_tar(&model_archive, &model_dir)?;
+
+    let _ = fs::remove_file(engine_archive);
+    let _ = fs::remove_file(model_archive);
+    emit_neural_progress(&app, "done", 1, 1, 1.0, "离线自然语音已就绪");
+    Ok(())
+}
+
+fn download_with_fallback(
+    app: &tauri::AppHandle,
+    urls: &[&str],
+    destination: &Path,
+    expected_hash: &str,
+    stage: &str,
+    label: &str,
+) -> Result<(), String> {
+    let mut last_error = "下载失败".to_string();
+    for url in urls {
+        match download_file(app, url, destination, expected_hash, stage, label) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = error;
+                let _ = fs::remove_file(destination);
+            }
+        }
+    }
+    Err(last_error)
+}
+
+fn part_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".part");
+    PathBuf::from(value)
+}
+
+fn download_file(
+    app: &tauri::AppHandle,
+    url: &str,
+    destination: &Path,
+    expected_hash: &str,
+    stage: &str,
+    label: &str,
+) -> Result<(), String> {
+    if destination.exists() {
+        if file_hash(destination)? == expected_hash {
+            return Ok(());
+        }
+        let _ = fs::remove_file(destination);
+    }
+
+    let partial = part_path(destination);
+    let existing = fs::metadata(&partial).map(|meta| meta.len()).unwrap_or(0);
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("Moyue/0.11 neural-tts")
+        .timeout(std::time::Duration::from_secs(1800))
+        .build()
+        .map_err(|error| format!("无法创建下载连接：{error}"))?;
+    let mut request = client.get(url);
+    if existing > 0 {
+        request = request.header(
+            reqwest::header::RANGE,
+            format!("bytes={existing}-"),
+        );
+    }
+    let mut response = request
+        .send()
+        .map_err(|error| format!("下载失败：{error}"))?;
+    let resumed = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if !response.status().is_success() && !resumed {
+        return Err(format!("下载失败：HTTP {}", response.status()));
+    }
+    let content_length = response.content_length().unwrap_or(0);
+    let start = if resumed { existing } else { 0 };
+    let total = if resumed {
+        existing.saturating_add(content_length)
+    } else {
+        content_length
+    };
+    let mut file = if resumed {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&partial)
+            .map_err(|error| error.to_string())?
+    } else {
+        fs::File::create(&partial).map_err(|error| error.to_string())?
+    };
+    let mut hasher = Sha256::new();
+    if resumed && existing > 0 {
+        let mut previous = fs::File::open(&partial).map_err(|error| error.to_string())?;
+        let mut buffer = [0u8; 256 * 1024];
+        loop {
+            let read = previous
+                .read(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    let mut downloaded = start;
+    let mut buffer = [0u8; 256 * 1024];
+    let started = std::time::Instant::now();
+    let mut last_emit = started;
+
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .map_err(|error| format!("下载中断：{error}"))?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .map_err(|error| format!("写入失败：{error}"))?;
+        hasher.update(&buffer[..read]);
+        downloaded += read as u64;
+        if last_emit.elapsed().as_millis() >= 180 || (total > 0 && downloaded == total) {
+            last_emit = std::time::Instant::now();
+            let percent = if total > 0 {
+                downloaded as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            };
+            emit_neural_progress(app, stage, downloaded, total, percent, label);
+        }
+    }
+    file.flush().map_err(|error| error.to_string())?;
+
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected_hash {
+        let _ = fs::remove_file(&partial);
+        return Err("下载文件校验失败，已取消".to_string());
+    }
+    fs::rename(&partial, destination).map_err(|error| format!("保存文件失败：{error}"))?;
+    Ok(())
+}
+
+fn extract_tar(archive: &Path, destination: &Path) -> Result<(), String> {
+    let mut command = Command::new("tar");
+    command
+        .arg("-xjf")
+        .arg(archive)
+        .arg("-C")
+        .arg(destination)
+        .arg("--strip-components=1");
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let status = command
+        .status()
+        .map_err(|error| format!("无法解压语音文件：{error}"))?;
+    if !status.success() {
+        return Err("解压语音文件失败".to_string());
+    }
+    Ok(())
+}
+
+fn file_hash(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 256 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn emit_neural_progress(
+    app: &tauri::AppHandle,
+    stage: &str,
+    downloaded: u64,
+    total: u64,
+    percent: f64,
+    message: &str,
+) {
+    let _ = app.emit(
+        "neural-progress",
+        NeuralProgress {
+            stage: stage.to_string(),
+            downloaded,
+            total,
+            percent,
+            message: message.to_string(),
+        },
+    );
+}
+
+fn neural_folder(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let folder = app_data_folder(app)?.join("neural");
+    fs::create_dir_all(&folder).map_err(|error| format!("无法创建离线语音目录：{error}"))?;
+    Ok(folder)
+}
+
+fn neural_engine_path(folder: &Path) -> PathBuf {
+    folder
+        .join("engine")
+        .join("bin")
+        .join("sherpa-onnx-offline-tts.exe")
+}
+
+fn neural_model_path(folder: &Path) -> PathBuf {
+    folder.join("model").join("model.onnx")
+}
+
+fn folder_size(folder: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                folder_size(&path)
+            } else {
+                entry.metadata().map(|meta| meta.len()).unwrap_or(0)
+            }
+        })
+        .sum()
+}
+
+fn prune_cache(folder: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("wav"))
+        .collect();
+    files.sort();
+    if files.len() > keep {
+        for path in &files[..files.len() - keep] {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[tauri::command]
+fn open_sponsor_issue() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        // `explorer` does not reliably open http(s) URLs on every Windows
+        // setup. FileProtocolHandler hands the URL to the default browser.
+        Command::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(SPONSOR_ISSUE_URL)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|error| format!("无法打开赞助登记页面：{error}"))?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Err("当前平台暂不支持自动打开浏览器".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn open_feedback(kind: String) -> Result<(), String> {
+    let url = if kind == "feature" {
+        FEATURE_ISSUE_URL.to_string()
+    } else if kind == "email" {
+        let subject = encode_uri_component("墨阅反馈");
+        let body = encode_uri_component("请描述你遇到的问题或建议：\n\n");
+        format!("mailto:{FEEDBACK_EMAIL}?subject={subject}&body={body}")
+    } else {
+        BUG_ISSUE_URL.to_string()
+    };
+    open_external_url(&url)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DroppedFile {
+    name: String,
+    data_base64: String,
+}
+
+#[derive(Serialize)]
+struct FolderScan {
+    files: Vec<String>,
+    truncated: bool,
+}
+
+#[tauri::command]
+fn fetch_remote_book(url: String) -> Result<DroppedFile, String> {
+    let response = reqwest::blocking::Client::builder()
+        .user_agent("Moyue/0.29 public-domain")
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|error| format!("无法创建下载连接：{error}"))?
+        .get(&url)
+        .send()
+        .map_err(|error| format!("下载失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("下载失败：HTTP {}", response.status()));
+    }
+    let name = url
+        .split('?')
+        .next()
+        .and_then(|value| value.rsplit('/').next())
+        .filter(|value| value.to_lowercase().ends_with(".epub"))
+        .unwrap_or("public-domain.epub")
+        .to_string();
+    let bytes = response.bytes().map_err(|error| format!("下载失败：{error}"))?;
+    if bytes.len() > 250 * 1024 * 1024 {
+        return Err("这本书超过 250 MB".to_string());
+    }
+    Ok(DroppedFile {
+        name,
+        data_base64: STANDARD.encode(bytes),
+    })
+}
+
+// ---------- online store (online edition) ----------
+
+const STORE_ORIGIN: &str = "https://www.sudugu.cc/";
+const GUTENBERG_ORIGIN: &str = "https://www.gutenberg.org/";
+const STORE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+fn is_sudugu_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed.starts_with(STORE_ORIGIN) && !trimmed.contains(char::is_whitespace)
+}
+
+/// Both shelves are read through Rust: the sites send no CORS headers, so the
+/// WebView cannot fetch their pages itself.
+fn is_store_page_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.contains(char::is_whitespace) {
+        return false;
+    }
+    trimmed.starts_with(STORE_ORIGIN) || trimmed.starts_with(GUTENBERG_ORIGIN)
+}
+
+fn store_client(timeout_seconds: u64) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent(STORE_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(timeout_seconds))
+        .build()
+        .map_err(|error| format!("无法连接书城：{error}"))
+}
+
+/// Fetch a book-store page (search results, category list, book detail or an
+/// OPDS feed). The site sends no CORS headers, so the WebView cannot read it.
+#[tauri::command]
+async fn fetch_store_page(url: String) -> Result<String, String> {
+    if !is_store_page_url(&url) {
+        return Err("不支持的书城地址".to_string());
+    }
+    let referer = if url.contains("gutenberg.org") {
+        GUTENBERG_ORIGIN
+    } else {
+        STORE_ORIGIN
+    };
+    let response = store_client(30)?
+        .get(url.trim())
+        .header("referer", referer)
+        .header("accept-language", "zh-CN,zh;q=0.9")
+        .send()
+        .await
+        .map_err(|error| format!("书城页面加载失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("书城页面加载失败：HTTP {}", response.status()));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("书城页面加载失败：{error}"))?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err("书城页面过大，已取消".to_string());
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Download one TXT segment of a book. The store answers with a GBK notice
+/// page instead of a file when it will not pack the book yet.
+#[tauri::command]
+async fn fetch_store_segment(url: String) -> Result<String, String> {
+    if !is_sudugu_url(&url) || !url.contains("/modules/article/packdown.php") {
+        return Err("不支持的下载地址".to_string());
+    }
+    let response = store_client(180)?
+        .get(url.trim())
+        .header("referer", STORE_ORIGIN)
+        .send()
+        .await
+        .map_err(|error| format!("下载失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("下载失败：HTTP {}", response.status()));
+    }
+    let is_file = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.starts_with("application/octet-stream"))
+        .unwrap_or(false);
+    if !is_file {
+        return Err("这本书暂时不能整本下载，请稍后再试或到原站阅读".to_string());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("下载失败：{error}"))?;
+    if bytes.is_empty() {
+        return Err("下载到的内容为空".to_string());
+    }
+    if bytes.len() > 80 * 1024 * 1024 {
+        return Err("单次下载超过 80 MB，已取消".to_string());
+    }
+    Ok(STANDARD.encode(bytes))
+}
+
+#[tauri::command]
+fn open_store_page(url: String) -> Result<(), String> {
+    if !is_sudugu_url(&url) {
+        return Err("不支持的书城地址".to_string());
+    }
+    open_external_url(url.trim())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteImage {
+    mime_type: String,
+    data_base64: String,
+}
+
+/// Fetch a cover image from the store so an imported TXT keeps its artwork.
+#[tauri::command]
+async fn check_latest_version() -> Result<String, String> {
+    let response = store_client(20)?
+        .get("https://moyue-release-files.oss-cn-hangzhou.aliyuncs.com/updates/android/latest.json")
+        .send()
+        .await
+        .map_err(|error| format!("检查更新失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("检查更新失败：HTTP {}", response.status()));
+    }
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取更新信息失败：{error}"))?;
+    let data: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("更新信息解析失败：{error}"))?;
+    data.get("version")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .ok_or_else(|| "更新信息缺少版本号".to_string())
+}
+
+#[tauri::command]
+async fn fetch_store_cover(url: String) -> Result<RemoteImage, String> {
+    if !is_sudugu_url(&url) || !url.contains("/files/") {
+        return Err("不支持的封面地址".to_string());
+    }
+    let response = store_client(30)?
+        .get(url.trim())
+        .header("referer", STORE_ORIGIN)
+        .send()
+        .await
+        .map_err(|error| format!("封面加载失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("封面加载失败：HTTP {}", response.status()));
+    }
+    let mime_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !mime_type.starts_with("image/") {
+        return Err("封面不是图片".to_string());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("封面加载失败：{error}"))?;
+    if bytes.is_empty() || bytes.len() > 6 * 1024 * 1024 {
+        return Err("封面图片大小不合适".to_string());
+    }
+    Ok(RemoteImage {
+        mime_type,
+        data_base64: STANDARD.encode(bytes),
+    })
+}
+
+#[tauri::command]
+fn scan_book_folder(path: String) -> Result<FolderScan, String> {
+    let folder = PathBuf::from(&path);
+    if !folder.is_dir() {
+        return Err("文件夹不存在".to_string());
+    }
+    let mut files = Vec::new();
+    collect_book_files(&folder, &mut files, 0);
+    files.sort();
+    let truncated = files.len() > 1000;
+    files.truncate(1000);
+    Ok(FolderScan { files, truncated })
+}
+
+fn collect_book_files(folder: &Path, files: &mut Vec<String>, depth: u8) {
+    if depth > 4 || files.len() >= 1001 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_book_files(&path, files, depth + 1);
+        } else {
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if extension == "epub"
+                || extension == "txt"
+                || extension == "pdf"
+                || extension == "mobi"
+                || extension == "azw3"
+            {
+                files.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn read_dropped_file(path: String) -> Result<DroppedFile, String> {
+    let file_path = PathBuf::from(&path);
+    if !file_path.is_file() {
+        return Err("拖入的文件不存在".to_string());
+    }
+    let name = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "无法读取文件名".to_string())?
+        .to_string();
+    if !name.to_lowercase().ends_with(".epub")
+        && !name.to_lowercase().ends_with(".txt")
+        && !name.to_lowercase().ends_with(".pdf")
+        && !name.to_lowercase().ends_with(".mobi")
+        && !name.to_lowercase().ends_with(".azw3")
+    {
+        return Err("只支持 EPUB、TXT、PDF、MOBI 和 AZW3".to_string());
+    }
+    let metadata = fs::metadata(&file_path).map_err(|error| format!("无法读取文件：{error}"))?;
+    if metadata.len() > 250 * 1024 * 1024 {
+        return Err("这本书超过 250 MB，暂时无法导入".to_string());
+    }
+    let bytes = fs::read(&file_path).map_err(|error| format!("无法读取文件：{error}"))?;
+    Ok(DroppedFile {
+        name,
+        data_base64: STANDARD.encode(bytes),
+    })
+}
+
+fn encode_uri_component(value: &str) -> String {
+    let mut result = String::new();
+    for byte in value.as_bytes() {
+        let character = *byte as char;
+        if character.is_ascii_alphanumeric() || "-_.~".contains(character) {
+            result.push(character);
+        } else {
+            result.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    result
+}
+
+#[tauri::command]
+fn append_diagnostic(
+    app: tauri::AppHandle,
+    level: String,
+    message: String,
+    detail: String,
+) -> Result<(), String> {
+    let folder = diagnostic_folder(&app)?;
+    let level = level.chars().take(12).collect::<String>();
+    let message = message.chars().take(2000).collect::<String>();
+    let detail = detail.chars().take(12000).collect::<String>();
+    let line = format!(
+        "[{}] [{}] {}{}\n",
+        now_millis(),
+        level,
+        message.replace('\n', " "),
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", detail)
+        }
+    );
+    append_log(&folder.join("moyue.log"), &line)
+}
+
+#[tauri::command]
+fn write_diagnostic_report(app: tauri::AppHandle, content: String) -> Result<String, String> {
+    if content.len() > 200_000 {
+        return Err("诊断内容过大".to_string());
+    }
+    let folder = diagnostic_folder(&app)?;
+    let path = folder.join(format!("diagnostics-{}.txt", now_millis()));
+    fs::write(&path, content).map_err(|error| format!("无法保存诊断报告：{error}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn open_diagnostics_folder(app: tauri::AppHandle) -> Result<(), String> {
+    let folder = diagnostic_folder(&app)?;
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(&folder)
+            .spawn()
+            .map_err(|error| format!("无法打开日志文件夹：{error}"))?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Err("当前平台暂不支持自动打开文件夹".to_string());
+    }
+    Ok(())
+}
+
+fn diagnostic_folder(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let folder = app_data_folder(app)?.join("logs");
+    fs::create_dir_all(&folder).map_err(|error| format!("无法创建日志目录：{error}"))?;
+    Ok(folder)
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn append_log(path: &Path, line: &str) -> Result<(), String> {
+    if let Ok(metadata) = fs::metadata(path) {
+        if metadata.len() > 2 * 1024 * 1024 {
+            let first = path.with_extension("log.1");
+            let second = path.with_extension("log.2");
+            let _ = fs::remove_file(&second);
+            let _ = fs::rename(&first, &second);
+            let _ = fs::rename(path, &first);
+        }
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("无法写入日志：{error}"))?;
+    file.write_all(line.as_bytes())
+        .map_err(|error| format!("无法写入日志：{error}"))
+}
+
+fn open_external_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(url)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|error| format!("无法打开浏览器：{error}"))?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = url;
+        return Err("当前平台暂不支持自动打开浏览器".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn write_backup(
+    app: tauri::AppHandle,
+    data_base64: String,
+    kind: String,
+) -> Result<String, String> {
+    if data_base64.len() > 1_500_000_000 {
+        return Err("备份文件过大，无法保存".to_string());
+    }
+    let bytes = STANDARD
+        .decode(data_base64.as_bytes())
+        .map_err(|error| format!("备份数据损坏：{error}"))?;
+    let folder = backup_folder(&app)?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let label = match kind.as_str() {
+        "auto" => "auto",
+        "pre-restore" => "pre-restore",
+        _ => "manual",
+    };
+    let path = folder.join(format!("moyue-{label}-{stamp}.zip"));
+    fs::write(&path, bytes).map_err(|error| format!("写入备份失败：{error}"))?;
+    prune_backups(&folder, 8);
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn backup_folder(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let folder = app_data_folder(app)?.join("backups");
+    fs::create_dir_all(&folder).map_err(|error| format!("无法创建备份目录：{error}"))?;
+    Ok(folder)
+}
+
+fn prune_backups(folder: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.starts_with("moyue-") && name.ends_with(".zip"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    if files.len() > keep {
+        for path in &files[..files.len() - keep] {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[tauri::command]
+fn uninstall_app(app: tauri::AppHandle, delete_data: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("无法定位当前程序：{error}"))?;
+        let install_dir = executable
+            .parent()
+            .ok_or_else(|| "无法定位安装目录".to_string())?;
+        let uninstaller = install_dir.join("uninstall.exe");
+        if !uninstaller.exists() {
+            return Err("没有找到卸载程序，请使用安装包重新安装后再卸载".to_string());
+        }
+
+        let data_folder = app_data_folder(&app)?;
+        let delete_data_line = if delete_data {
+            format!(
+                "rmdir /s /q \"{}\"\r\n",
+                data_folder.to_string_lossy()
+            )
+        } else {
+            String::new()
+        };
+        let batch_path = std::env::temp_dir().join(format!(
+            "moyue-uninstall-{}.cmd",
+            std::process::id()
+        ));
+        let script = format!(
+            "@echo off\r\n\
+             timeout /t 2 /nobreak >nul\r\n\
+             start \"\" /wait \"{}\" /S\r\n\
+             timeout /t 2 /nobreak >nul\r\n\
+             {}\
+             del \"%~f0\"\r\n",
+            uninstaller.to_string_lossy(),
+            delete_data_line
+        );
+        fs::write(&batch_path, script)
+            .map_err(|error| format!("无法准备卸载程序：{error}"))?;
+
+        Command::new("cmd")
+            .arg("/C")
+            .arg(&batch_path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|error| format!("无法启动卸载程序：{error}"))?;
+
+        app.exit(0);
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        let _ = delete_data;
+        Err("自动卸载目前仅支持 Windows".to_string())
+    }
+}
+
+fn app_data_folder(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let folder = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("无法定位应用数据目录：{error}"))?;
+    fs::create_dir_all(&folder).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
+    Ok(folder)
+}
+
+fn music_folder(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let folder = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位应用数据目录：{error}"))?
+        .join("music");
+    fs::create_dir_all(&folder).map_err(|error| format!("无法创建音乐文件夹：{error}"))?;
+    Ok(folder)
+}
+
+fn collect_music(folder: &Path, tracks: &mut Vec<MusicTrack>, depth: u8) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_music(&path, tracks, depth + 1);
+            continue;
+        }
+        if !is_audio_file(&path) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        tracks.push(MusicTrack {
+            file_name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            path: path.to_string_lossy().into_owned(),
+            size: metadata.len(),
+            modified,
+        });
+    }
+}
+
+fn is_audio_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("mp3" | "flac" | "wav" | "m4a" | "aac" | "ogg" | "opus")
+    )
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .manage(UpdateStore::default())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            if let Ok(dir) = app.path().app_local_data_dir() {
+                let logs = dir.join("logs");
+                let _ = fs::create_dir_all(&logs);
+                let previous = panic::take_hook();
+                panic::set_hook(Box::new(move |info| {
+                    let line = format!("[{}] [PANIC] {}\n", now_millis(), info);
+                    let _ = append_log(&logs.join("moyue.log"), &line);
+                    previous(info);
+                }));
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            app_info,
+            music_dir,
+            list_music,
+            open_music_folder,
+            data_dir,
+            open_data_folder,
+            backup_dir,
+            open_backup_folder,
+            write_backup,
+            open_sponsor_issue,
+            open_feedback,
+            read_dropped_file,
+            fetch_remote_book,
+            fetch_store_page,
+            fetch_store_segment,
+            fetch_store_cover,
+            check_latest_version,
+            open_store_page,
+            scan_book_folder,
+            check_app_update,
+            download_app_update,
+            install_app_update,
+            append_diagnostic,
+            write_diagnostic_report,
+            open_diagnostics_folder,
+            neural_status,
+            download_neural,
+            remove_neural,
+            sherpa_speak,
+            uninstall_app
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
