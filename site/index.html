@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>墨阅 Android · 手机上，也能安静读书</title>
+    <meta
+      name="description"
+      content="墨阅 Android 版：本地书架、在线书城、EPUB / TXT / PDF 阅读，目录、书签、划线笔记和阅读统计。"
+    />
+    <meta name="theme-color" content="#f4eee3" />
+    <link rel="icon" href="assets/icon.png" />
+    <link rel="stylesheet" href="styles.css?v=0.33.3-1" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="墨阅 Android 首页">
+        <span class="brand__seal">墨</span>
+        <span class="brand__text">
+          <strong>墨阅</strong>
+          <small>ANDROID</small>
+        </span>
+      </a>
+      <a class="desktop-link" href="https://langlijun666.github.io/moyue-reader/" target="_blank" rel="noreferrer">
+        电脑版
+        <span>→</span>
+      </a>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero__copy">
+          <span class="eyebrow"><i></i> ANDROID EDITION</span>
+          <h1>手机上，<br /><em>也能安静读书。</em></h1>
+          <p class="hero__lead">
+            书架、书城、目录、书签和划线笔记都带到了手机。左右滑动或点屏幕两侧翻页，
+            轻点正文中间收起工具栏，底部抽屉可以下拉关闭。
+          </p>
+
+          <div class="hero__actions">
+            <a
+              class="button"
+              id="androidGithubButton"
+              href="https://github.com/Langlijun666/moyue-android/releases/download/android-v0.33.3/Moyue.Android_0.33.3_arm64.apk"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <span class="button__icon">↓</span>
+              <span>
+                <strong>下载 Android APK</strong>
+                <small id="androidMeta">GitHub · v0.33.3 · arm64</small>
+              </span>
+            </a>
+            <a
+              class="button button--ghost"
+              id="androidOssButton"
+              href="https://moyue-release-files.oss-cn-hangzhou.aliyuncs.com/updates/android/Moyue.Android_0.33.3_arm64.apk.zip"
+              target="_blank"
+              rel="noreferrer"
+            >
+              OSS 镜像（ZIP）
+            </a>
+          </div>
+
+          <p class="hero__note" id="androidNote">
+            Android 7.0+ · arm64 · 约 46 MB · debug 签名测试包。安装时请允许「未知来源」；
+            OSS 镜像因阿里云限制为压缩包，解压后安装。
+          </p>
+          <p class="hero__repo">
+            <a href="https://github.com/Langlijun666/moyue-android" target="_blank" rel="noreferrer">
+              moyue-android 仓库 →
+            </a>
+          </p>
+        </div>
+
+        <div class="hero__phones" aria-hidden="true">
+          <img class="phone phone--back" src="assets/shelf.png" alt="" />
+          <img class="phone phone--front" src="assets/reader.png" alt="" />
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section__head">
+          <span class="eyebrow"><i></i> READING</span>
+          <h2>手机上的阅读，<br />该有的都有。</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <span>01</span>
+            <h3>沉浸阅读</h3>
+            <p>默认隐藏工具栏，正文占满屏幕。轻点中间呼出菜单，左右两侧翻页。</p>
+          </article>
+          <article>
+            <span>02</span>
+            <h3>书架与书城</h3>
+            <p>书架分类、在线书城、公版书，导入 EPUB / TXT / PDF / MOBI / AZW3。</p>
+          </article>
+          <article>
+            <span>03</span>
+            <h3>目录与笔记</h3>
+            <p>目录定位当前章节，书签、划线和笔记都按书保存，随时跳回原文。</p>
+          </article>
+          <article>
+            <span>04</span>
+            <h3>阅读统计</h3>
+            <p>今天读多久、读了多少页、连续阅读天数，都在本机记录。</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section section--split">
+        <div>
+          <span class="eyebrow"><i></i> SETTINGS</span>
+          <h2>目录、设置、笔记，<br />都是底部抽屉。</h2>
+          <p>
+            翻页方式、纸张、字体、字号、行距和第二天的阅读进度都在设置里。
+            抽屉可以从顶部把手向下拖动关闭，不会打断阅读。
+          </p>
+        </div>
+        <img class="shot" src="assets/settings.png" alt="墨阅 Android 阅读设置" />
+      </section>
+
+      <section class="section" id="install">
+        <div class="section__head">
+          <span class="eyebrow"><i></i> INSTALL</span>
+          <h2>三步装到手机上。</h2>
+        </div>
+        <ol class="steps">
+          <li>
+            <strong>下载 APK</strong>
+            <p>点上面的 GitHub 按钮直接下载；OSS 是压缩包，解压后得到 APK。</p>
+          </li>
+          <li>
+            <strong>允许安装未知应用</strong>
+            <p>Android 会提示来源未知，进入设置允许浏览器或文件管理器安装应用。</p>
+          </li>
+          <li>
+            <strong>打开墨阅</strong>
+            <p>导入本地书，或者去书城找一本；阅读进度只保存在这台手机上。</p>
+          </li>
+        </ol>
+      </section>
+
+      <section class="section" id="faq">
+        <div class="section__head">
+          <span class="eyebrow"><i></i> QUESTIONS</span>
+          <h2>你可能想知道。</h2>
+        </div>
+        <div class="faq">
+          <details>
+            <summary>有电脑版吗？</summary>
+            <p>
+              有，而且和手机版是两个独立网站。电脑版在
+              <a href="https://langlijun666.github.io/moyue-reader/" target="_blank" rel="noreferrer">这里</a>，
+              支持 Windows 10 / 11、本地音乐和离线听书。
+            </p>
+          </details>
+          <details>
+            <summary>为什么没有音乐和听书？</summary>
+            <p>手机版第一版先聚焦阅读和书城，暂不包含本地音乐、离线听书和自动更新。</p>
+          </details>
+          <details>
+            <summary>怎么更新？</summary>
+            <p>设置里可以手动检查更新，下载新 APK 覆盖安装；书籍、进度和笔记会保留。</p>
+          </details>
+          <details>
+            <summary>为什么提示未知发布者？</summary>
+            <p>目前的 APK 使用 debug 签名，适合试用，不适合上架商店。安装时选择「仍要安装」即可。</p>
+          </details>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div>
+        <strong>墨阅 Android</strong>
+        <p>把世界读慢一点。</p>
+      </div>
+      <nav>
+        <a href="https://langlijun666.github.io/moyue-reader/" target="_blank" rel="noreferrer">电脑版</a>
+        <a href="https://github.com/Langlijun666/moyue-android" target="_blank" rel="noreferrer">GitHub</a>
+        <a href="https://github.com/Langlijun666/moyue-android/releases" target="_blank" rel="noreferrer">更新日志</a>
+      </nav>
+      <small>MIT License · 本地优先 · Android 7.0+</small>
+    </footer>
+
+    <script src="app.js?v=0.33.3-1"></script>
+  </body>
+</html>

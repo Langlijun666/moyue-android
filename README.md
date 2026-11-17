@@ -4,7 +4,7 @@
 
 手机端交互：默认沉浸阅读，轻点正文中间切换工具栏，左右滑动或点击屏幕两侧翻页。暂不包含本地音乐、离线听书和自动更新；设置里可以手动检查更新。
 
-## 下载
+## 网站\n\n手机版官网：https://langlijun666.github.io/moyue-android/\n\n电脑版官网：https://langlijun666.github.io/moyue-reader/\n\n## 下载
 
 - [GitHub Releases](https://github.com/Langlijun666/moyue-android/releases/latest)
 - OSS 镜像（ZIP）：`https://moyue-release-files.oss-cn-hangzhou.aliyuncs.com/updates/android/Moyue.Android_0.33.3_arm64.apk.zip`
