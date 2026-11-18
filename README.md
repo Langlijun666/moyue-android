@@ -1,6 +1,6 @@
 # 墨阅 · Android
 
-墨阅的 Android 版：本地书架、在线书城、EPUB / TXT / PDF / MOBI / AZW3 阅读、目录、书签、划线与笔记、阅读统计。
+墨阅的 Android 版：本地书架、在线书城与轻小说文库、EPUB / TXT / PDF / MOBI / AZW3 阅读、目录、书签、划线与笔记、阅读统计。
 
 手机端交互：书架支持列表 / 网格两种模式，右上角一键切换；默认沉浸阅读，轻点正文中间切换工具栏，左右滑动或点击屏幕两侧翻页。暂不包含本地音乐、离线听书和自动更新；设置里可以手动检查更新。
 
@@ -13,9 +13,9 @@
 ## 下载
 
 - [GitHub Releases](https://github.com/Langlijun666/moyue-android/releases/latest)
-- OSS 镜像（ZIP）：`https://moyue-release-files.oss-cn-hangzhou.aliyuncs.com/updates/android/Moyue.Android_0.33.10_arm64.apk.zip`
+- OSS 镜像（ZIP）：`https://moyue-release-files.oss-cn-hangzhou.aliyuncs.com/updates/android/Moyue.Android_0.33.11_arm64.apk.zip`
 
-当前 **v0.33.10 · arm64 · Android 7.0+**，debug 签名测试包，需要允许「安装未知应用」。调试包适合试用，不适合直接上架。
+当前 **v0.33.11 · arm64 · Android 7.0+**，debug 签名测试包，需要允许「安装未知应用」。调试包适合试用，不适合直接上架。
 
 > 阿里云 OSS 默认域名不允许直接公开分发 `.apk`，所以 OSS 渠道提供的是 APK 压缩包；GitHub 渠道可以直接下载 APK。
 
