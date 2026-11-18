@@ -1,13 +1,13 @@
 {
   "productName": "墨阅",
-  "version": "0.33.11",
+  "version": "0.33.12",
   "identifier": "com.moyue.reader",
   "build": {
     "beforeBuildCommand": "npm run build:online"
   },
   "bundle": {
     "android": {
-      "versionCode": 33017
+      "versionCode": 33018
     }
   }
 }
