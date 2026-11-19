@@ -14,6 +14,7 @@ import {
   trashBook,
 } from "./lib/db";
 import { inspectEpub } from "./lib/epub";
+import { splitOversizedEpub } from "./lib/epubSplit";
 import { inspectPdf } from "./lib/pdf";
 import { mobiToEpubFile } from "./lib/mobi";
 import { createBackupBase64, readBackupFile } from "./lib/backup";
@@ -50,6 +51,7 @@ import { OnlineLibrary } from "./components/OnlineLibrary";
 import { IS_ONLINE_EDITION } from "./edition";
 import { IS_ANDROID } from "./lib/platform";
 import { FullShelf } from "./components/FullShelf";
+import { VolumePicker } from "./components/VolumePicker";
 import { MusicPlayer } from "./components/MusicPlayer";
 import { CategoryManager } from "./components/CategoryManager";
 import { AssignCategories } from "./components/AssignCategories";
@@ -66,6 +68,17 @@ import { ChangelogDialog } from "./components/ChangelogDialog";
 const AUTO_BACKUP_KEY = "moyue.backup.auto.v1";
 const AUTO_BACKUP_INTERVAL = 24 * 60 * 60 * 1000;
 const APP_VERSION = "0.33.3";
+
+function volumeGroupKey(book: BookMeta): string {
+  if (book.groupId) return book.groupId;
+  const match = book.title.match(/^(.*?)\s*卷\s*\d+/);
+  return match ? `legacy:${match[1].trim()}` : `book:${book.id}`;
+}
+
+function volumeBaseTitle(book: BookMeta): string {
+  const match = book.title.match(/^(.*?)\s*卷\s*\d+/);
+  return book.groupTitle || match?.[1]?.trim() || book.title;
+}
 
 export default function App() {
   const [library, setLibrary] = useState<BookMeta[]>([]);
@@ -97,6 +110,7 @@ export default function App() {
   const [changelogOpen, setChangelogOpen] = useState(false);
   const [libraryManagerOpen, setLibraryManagerOpen] = useState(false);
   const [onlineLibraryOpen, setOnlineLibraryOpen] = useState(false);
+  const [volumePicker, setVolumePicker] = useState<{ title: string; books: BookMeta[] } | null>(null);
   const [deletedBooks, setDeletedBooks] = useState<BookMeta[]>([]);
   const [sortBy, setSortBy] = useState<LibrarySort>(() => {
     try {
@@ -398,7 +412,29 @@ export default function App() {
     } else {
       sorted.sort((a, b) => b.lastOpenedAt - a.lastOpenedAt);
     }
-    return sorted.map((book) => ({ ...book, progress: progressMap[book.id] }));
+
+    const grouped = new Map<string, (BookMeta & { progress?: Progress })[]>();
+    for (const book of sorted) {
+      const key = volumeGroupKey(book);
+      const list = grouped.get(key);
+      if (list) list.push({ ...book, progress: progressMap[book.id] });
+      else grouped.set(key, [{ ...book, progress: progressMap[book.id] }]);
+    }
+
+    return [...grouped.values()]
+      .map((books) => {
+        const representative = [...books].sort((a, b) => b.lastOpenedAt - a.lastOpenedAt)[0];
+        if (books.length < 2) return representative;
+        const groupKey = volumeGroupKey(representative);
+        return {
+          ...representative,
+          title: volumeBaseTitle(representative),
+          groupTitle: volumeBaseTitle(representative),
+          groupId: groupKey,
+          volumeCount: books.length,
+        };
+      })
+      .sort((a, b) => b.lastOpenedAt - a.lastOpenedAt);
   }, [library, progressMap, sortBy]);
 
   const categoryCounts = useMemo(() => {
@@ -433,6 +469,34 @@ export default function App() {
       if (file.size > BOOK_MAX_BYTES) {
         if (!silent) setToast(`这本书超过 ${Math.round(BOOK_MAX_BYTES / 1024 / 1024)} MB，暂时无法导入`);
         return "failed";
+      }
+
+      if (/\.epub$/i.test(file.name) && file.size > 120 * 1024 * 1024) {
+        setBusy(true);
+        try {
+          setToast("文件较大，正在自动拆分并导入…");
+          const volumes = await splitOversizedEpub(file);
+          if (!volumes.length) throw new Error("no volumes");
+          let added = 0;
+          for (let index = 0; index < volumes.length; index += 1) {
+            const volumeFile = new File([volumes[index].data], volumes[index].name, {
+              type: "application/epub+zip",
+            });
+            const result = await importFileRef.current?.(volumeFile, {
+              open: index === 0,
+              silent: true,
+              skipExisting: true,
+            });
+            if (result === "added" || result === "updated") added += 1;
+          }
+          if (!silent) setToast(`已自动拆分为 ${added} 卷并加入书架`);
+          return added > 0 ? "added" : "failed";
+        } catch {
+          if (!silent) setToast("文件过大，自动拆分失败，请尝试按卷拆分的 EPUB");
+          return "failed";
+        } finally {
+          setBusy(false);
+        }
       }
 
       setBusy(true);
@@ -500,8 +564,13 @@ export default function App() {
   );
 
   const onPickFile = (files: FileList | null) => {
-    const file = files?.[0];
-    if (file) void importFile(file);
+    const list = [...(files ?? [])];
+    if (!list.length) return;
+    void (async () => {
+      for (let index = 0; index < list.length; index += 1) {
+        await importFile(list[index], { open: index === 0 });
+      }
+    })();
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
@@ -799,7 +868,7 @@ export default function App() {
     }
   };
 
-  const openBook = async (book: BookMeta) => {
+  const openBookDirect = async (book: BookMeta) => {
     if (busy) return;
     setBusy(true);
     try {
@@ -823,6 +892,18 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  };
+
+  const openBook = async (book: BookMeta) => {
+    const key = volumeGroupKey(book);
+    if (key && (book.volumeCount ?? 0) > 1) {
+      const volumes = library
+        .filter((item) => volumeGroupKey(item) === key)
+        .sort((a, b) => a.title.localeCompare(b.title, "zh-CN"));
+      setVolumePicker({ title: volumeBaseTitle(book), books: volumes });
+      return;
+    }
+    await openBookDirect(book);
   };
 
   const loadSample = async () => {
@@ -1236,6 +1317,7 @@ export default function App() {
         ref={fileInputRef}
         className="visually-hidden"
         type="file"
+        multiple
         accept={BOOK_ACCEPT}
         onChange={(event) => onPickFile(event.target.files)}
       />
@@ -1375,6 +1457,17 @@ export default function App() {
         onEmptyTrash={() => void emptyTrash()}
       />
 
+
+      <VolumePicker
+        open={Boolean(volumePicker)}
+        title={volumePicker?.title ?? ""}
+        books={volumePicker?.books ?? []}
+        onOpen={(book) => {
+          setVolumePicker(null);
+          void openBookDirect(book);
+        }}
+        onClose={() => setVolumePicker(null)}
+      />
 
       <SponsorDialog
         open={sponsorOpen}
